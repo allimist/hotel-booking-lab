@@ -1,0 +1,896 @@
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import jwt from '@fastify/jwt';
+import { Pool } from 'pg';
+import Redis from 'ioredis';
+import { Kafka } from 'kafkajs';
+import crypto from 'crypto';
+
+const app = Fastify({ logger: true });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+const kafka = new Kafka({ clientId: 'hotel-booking-lab-api', brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(',') });
+const producer = kafka.producer();
+
+app.register(cors, { origin: process.env.CORS_ORIGIN || true });
+app.register(jwt, { secret: process.env.JWT_SECRET || 'dev-secret' });
+
+type Role = 'CUSTOMER'|'SELLER'|'ADMIN';
+
+declare module 'fastify' {
+  interface FastifyRequest {
+    userCtx?: { id: string; role: Role; impersonatedBy?: string };
+  }
+}
+
+const MAX_NIGHTS = 30;
+const PAYMENT_WINDOW_SECONDS = Number(process.env.PAYMENT_WINDOW_SECONDS || 60);
+
+function id() { return crypto.randomUUID(); }
+
+async function auth(req: any, roles?: Role[]) {
+  try {
+    const p: any = await req.jwtVerify();
+    req.userCtx = { id: p.id, role: p.role, impersonatedBy: p.impersonatedBy };
+    if (roles && !roles.includes(p.role)) throw new Error('FORBIDDEN');
+  } catch {
+    throw { statusCode: 401, message: 'Unauthorized' };
+  }
+}
+
+async function tryAuth(req: any) {
+  if (!req.headers?.authorization) return;
+  try {
+    const p: any = await req.jwtVerify();
+    req.userCtx = { id: p.id, role: p.role, impersonatedBy: p.impersonatedBy };
+  } catch { /* anonymous */ }
+}
+
+async function addOutbox(client: any, topic: string, key: string, payload: any) {
+  await client.query(
+    `INSERT INTO outbox_events(id,topic,event_key,payload) VALUES($1,$2,$3,$4)`,
+    [id(), topic, key, JSON.stringify(payload)]
+  );
+}
+
+// ---- Date helpers -------------------------------------------------------
+// Dates are plain YYYY-MM-DD strings (hotel-local calendar days, no timezone math).
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function addDays(d: string, n: number) {
+  const t = new Date(d + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
+}
+/** Returns each night (check-in inclusive, check-out exclusive) of a stay. */
+function nightsOf(checkIn: string, checkOut: string) {
+  const out: string[] = [];
+  for (let d = checkIn; d < checkOut; d = addDays(d, 1)) out.push(d);
+  return out;
+}
+/** Validates a stay range; returns the nights or an error message. */
+function parseRange(checkIn: any, checkOut: any): { nights: string[] } | { error: string } {
+  if (!DATE_RE.test(String(checkIn)) || !DATE_RE.test(String(checkOut))) return { error: 'checkIn and checkOut must be YYYY-MM-DD' };
+  if (isNaN(Date.parse(checkIn)) || isNaN(Date.parse(checkOut))) return { error: 'Invalid date' };
+  if (checkIn < todayStr()) return { error: 'checkIn cannot be in the past' };
+  if (checkOut <= checkIn) return { error: 'checkOut must be after checkIn' };
+  const nights = nightsOf(checkIn, checkOut);
+  if (nights.length > MAX_NIGHTS) return { error: `Stay cannot exceed ${MAX_NIGHTS} nights` };
+  return { nights };
+}
+
+// ---- Redis availability (one counter per room per night) ---------------
+const nightKey = (roomId: string, night: string) => `availability:${roomId}:${night}`;
+
+/** Reads availability for every night; missing keys mean "never touched" = total_rooms. */
+async function availabilityFor(roomId: string, totalRooms: number, nights: string[]) {
+  const vals = await redis.mget(nights.map(n => nightKey(roomId, n)));
+  return Math.min(...vals.map(v => v === null ? totalRooms : Number(v)));
+}
+
+// All-or-nothing: only decrements when every night still has stock.
+const RESERVE_LUA = `
+  for i=1,#KEYS do
+    local v=redis.call('GET',KEYS[i])
+    if not v then v=ARGV[1]; redis.call('SET',KEYS[i],v) end
+    if tonumber(v) <= 0 then return -1 end
+  end
+  local min=nil
+  for i=1,#KEYS do
+    local r=redis.call('DECR',KEYS[i])
+    if min==nil or r<min then min=r end
+  end
+  return min
+`;
+// Gives nights back, never exceeding the room's total inventory.
+const RELEASE_LUA = `
+  local min=nil
+  for i=1,#KEYS do
+    local v=redis.call('GET',KEYS[i])
+    local r
+    if not v then r=tonumber(ARGV[1]) else r=math.min(tonumber(v)+1, tonumber(ARGV[1])); redis.call('SET',KEYS[i],r) end
+    if min==nil or r<min then min=r end
+  end
+  return min
+`;
+
+async function deleteRoomAvailability(roomId: string) {
+  const keys = await redis.keys(`availability:${roomId}:*`);
+  if (keys.length) await redis.del(...keys);
+}
+
+// ---- Routes --------------------------------------------------------------
+app.get('/api/health', async () => ({ ok: true, service: 'hotel-booking-lab-api' }));
+
+// Learning project only: passwords are stored in plain text and listed on the login page so anyone can try every role.
+app.get('/api/auth/demo-accounts', async () => {
+  const r = await pool.query(`
+    SELECT name, email, password_hash AS password, role, is_sample AS "isSample"
+    FROM users ORDER BY CASE role WHEN 'ADMIN' THEN 0 WHEN 'SELLER' THEN 1 ELSE 2 END, created_at, email LIMIT 2000`);
+  return r.rows;
+});
+
+app.post('/api/auth/login', async (req: any, reply) => {
+  const { email, password } = req.body || {};
+  const r = await pool.query(`SELECT id,email,name,role,password_hash FROM users WHERE email=$1`, [email]);
+  if (!r.rows[0] || r.rows[0].password_hash !== password) return reply.code(401).send({ error: 'Invalid credentials' });
+  const u = r.rows[0];
+  return { token: app.jwt.sign({ id: u.id, role: u.role }), user: { id:u.id,email:u.email,name:u.name,role:u.role } };
+});
+
+app.get('/api/hotels', async (req: any) => {
+  await tryAuth(req);
+  const { city, page='1', limit='12' } = req.query;
+  const offset = (Number(page)-1) * Number(limit);
+  const values:any[] = [];
+  const conds: string[] = [];
+  if (city) { values.push(`%${city}%`); conds.push(`h.city ILIKE $${values.length}`); }
+  if (req.userCtx?.role === 'SELLER') { values.push(req.userCtx.id); conds.push(`h.seller_id = $${values.length}`); }
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  values.push(Number(limit), offset);
+  const r = await pool.query(`
+    SELECT h.id,h.name,h.address,h.city,h.description,
+      COALESCE(MIN(r.price),0) AS "startingPrice",
+      (SELECT hp.url FROM hotel_photos hp WHERE hp.hotel_id=h.id LIMIT 1) AS thumbnail
+    FROM hotels h LEFT JOIN rooms r ON r.hotel_id=h.id
+    ${where}
+    GROUP BY h.id
+    ORDER BY h.created_at DESC
+    LIMIT $${values.length-1} OFFSET $${values.length}`, values);
+  return { page:Number(page), limit:Number(limit), items:r.rows };
+});
+
+// Optional ?checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD; defaults to tonight.
+app.get('/api/hotels/:id', async (req:any, reply) => {
+  const checkIn = req.query.checkIn || todayStr();
+  const checkOut = req.query.checkOut || addDays(checkIn, 1);
+  const range = parseRange(checkIn, checkOut);
+  if ('error' in range) return reply.code(400).send({ error: range.error });
+  await tryAuth(req);
+  const h = await pool.query(`SELECT * FROM hotels WHERE id=$1`, [req.params.id]);
+  if (!h.rows[0]) return reply.code(404).send({error:'Hotel not found'});
+  if (req.userCtx?.role === 'SELLER' && h.rows[0].seller_id !== req.userCtx.id) return reply.code(403).send({error:'This hotel belongs to another seller'});
+  const rooms = await pool.query(`SELECT * FROM rooms WHERE hotel_id=$1 ORDER BY price`, [req.params.id]);
+  const photos = await pool.query(`SELECT * FROM hotel_photos WHERE hotel_id=$1`, [req.params.id]);
+  const enriched = [];
+  for (const room of rooms.rows) {
+    const availableRooms = await availabilityFor(room.id, room.total_rooms, range.nights);
+    enriched.push({ ...room, availableRooms, nights: range.nights.length, totalPrice: Number(room.price) * range.nights.length });
+  }
+  return { ...h.rows[0], checkIn, checkOut, nights: range.nights.length, rooms:enriched, photos:photos.rows };
+});
+
+/** Reserves the nights in Redis, then persists the booking + outbox events. Throws {statusCode:409} when sold out. */
+async function createBooking(userId: string, r: any, checkIn: string, checkOut: string, nights: string[], status: 'PENDING'|'CONFIRMED' = 'PENDING', windowSeconds = PAYMENT_WINDOW_SECONDS) {
+  const keys = nights.map(n => nightKey(r.id, n));
+  const t0 = performance.now();
+  const remaining = Number(await redis.eval(RESERVE_LUA, keys.length, ...keys, String(r.total_rooms)));
+  const redisMs = performance.now() - t0;
+  if (remaining < 0) throw { statusCode: 409, message: 'No rooms available for the selected dates', redisMs };
+  const totalPrice = Number(r.price) * nights.length;
+  const t1 = performance.now();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const bookingId=id();
+    // PENDING = room locked while the customer pays; the expiry worker releases it if they don't.
+    const ins = await client.query(
+      `INSERT INTO bookings(id,user_id,hotel_id,room_id,status,price,check_in,check_out,expires_at,paid_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $5='PENDING' THEN now() + ($9 * interval '1 second') END, CASE WHEN $5='CONFIRMED' THEN now() END)
+       RETURNING expires_at AS "expiresAt"`,
+      [bookingId,userId,r.hotel_id,r.id,status,totalPrice,checkIn,checkOut,windowSeconds]
+    );
+    const expiresAt = ins.rows[0].expiresAt;
+    await addOutbox(client,'booking.created',bookingId,{bookingId,userId,hotelId:r.hotel_id,roomId:r.id,status,checkIn,checkOut,nights:nights.length,totalPrice,remaining,expiresAt});
+    await addOutbox(client,'room.availability.changed',r.id,{roomId:r.id,checkIn,checkOut,remaining});
+    await client.query('COMMIT');
+    return { bookingId, status, checkIn, checkOut, nights: nights.length, totalPrice, remaining, expiresAt, paymentWindowSeconds: status==='PENDING' ? windowSeconds : 0,
+      timings: { redisMs, pgMs: performance.now() - t1 } };
+  } catch(e) {
+    await client.query('ROLLBACK');
+    await redis.eval(RELEASE_LUA, keys.length, ...keys, String(r.total_rooms));
+    throw e;
+  } finally { client.release(); }
+}
+
+app.post('/api/bookings', async (req:any, reply) => {
+  await auth(req, ['CUSTOMER']);
+  const { roomId, checkIn, checkOut } = req.body || {};
+  const range = parseRange(checkIn, checkOut);
+  if ('error' in range) return reply.code(400).send({ error: range.error });
+  const room = await pool.query(`SELECT * FROM rooms WHERE id=$1`, [roomId]);
+  if (!room.rows[0]) return reply.code(404).send({error:'Room not found'});
+  try {
+    return await createBooking(req.userCtx!.id, room.rows[0], checkIn, checkOut, range.nights);
+  } catch (e: any) {
+    if (e?.statusCode === 409) return reply.code(409).send({ error: e.message });
+    throw e;
+  }
+});
+
+app.get('/api/bookings/me', async (req:any) => {
+  await auth(req, ['CUSTOMER']);
+  const r=await pool.query(`
+    SELECT b.id,b.status,b.price,b.created_at,b.expires_at AS "expiresAt",b.paid_at AS "paidAt",
+      GREATEST(0, CEIL(EXTRACT(EPOCH FROM (b.expires_at - now()))))::int AS "secondsLeft",
+      to_char(b.check_in,'YYYY-MM-DD') AS "checkIn", to_char(b.check_out,'YYYY-MM-DD') AS "checkOut",
+      (b.check_out - b.check_in) AS nights,
+      h.id AS "hotelId", h.name AS "hotelName", h.city, r.name AS "roomName", r.price AS "nightlyPrice"
+    FROM bookings b JOIN hotels h ON h.id=b.hotel_id JOIN rooms r ON r.id=b.room_id
+    WHERE b.user_id=$1 ORDER BY b.check_in DESC, b.created_at DESC`, [req.userCtx!.id]);
+  const active = (b:any) => b.status === 'CONFIRMED' || b.status === 'PENDING';
+  const confirmed = r.rows.filter(active);
+  return r.rows.map((b:any) => ({
+    ...b,
+    // Other active stays sharing at least one night with this one (a "double booking").
+    overlaps: !active(b) ? [] : confirmed
+      .filter((o:any) => o.id !== b.id && o.checkIn < b.checkOut && b.checkIn < o.checkOut)
+      .map((o:any) => ({ id:o.id, hotelName:o.hotelName, city:o.city, checkIn:o.checkIn, checkOut:o.checkOut })),
+  }));
+});
+
+/** PENDING -> CONFIRMED inside the payment window. Throws {statusCode:404|409}. No real payment is processed. */
+async function payBooking(bookingId: string, userId: string) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const upd = await client.query(
+      `UPDATE bookings SET status='CONFIRMED', paid_at=now()
+       WHERE id=$1 AND user_id=$2 AND status='PENDING' AND expires_at > now() RETURNING *`, [bookingId, userId]);
+    const row = upd.rows[0];
+    if (!row) {
+      await client.query('ROLLBACK');
+      const b = await pool.query(`SELECT status, expires_at FROM bookings WHERE id=$1 AND user_id=$2`, [bookingId, userId]);
+      if (!b.rows[0]) throw { statusCode: 404, message: 'Booking not found' };
+      if (b.rows[0].status === 'PENDING') throw { statusCode: 409, message: 'Payment window has passed; the room was released' };
+      throw { statusCode: 409, message: `Booking is ${b.rows[0].status.replace('_',' ').toLowerCase()}` };
+    }
+    await addOutbox(client,'booking.confirmed',row.id,{bookingId:row.id,userId:row.user_id,hotelId:row.hotel_id,roomId:row.room_id,paidAt:row.paid_at,totalPrice:Number(row.price)});
+    await client.query('COMMIT');
+    return { bookingId: row.id, status: 'CONFIRMED' as const, paidAt: row.paid_at };
+  } catch(e) { await client.query('ROLLBACK').catch(()=>{}); throw e; } finally { client.release(); }
+}
+
+/** Marks a PENDING/CONFIRMED booking CANCELLED and releases its nights. `force` skips the owner and stay-started checks (admin). */
+async function cancelBooking(bookingId: string, opts: { userId?: string; force?: boolean }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const b = await client.query(
+      `SELECT b.*, r.total_rooms, to_char(b.check_in,'YYYY-MM-DD') AS ci, to_char(b.check_out,'YYYY-MM-DD') AS co
+       FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.id=$1 ${opts.userId ? 'AND b.user_id=$2' : ''} FOR UPDATE`,
+      opts.userId ? [bookingId, opts.userId] : [bookingId]);
+    const row = b.rows[0];
+    if (!row) throw { statusCode: 404, message: 'Booking not found' };
+    if (row.status !== 'CONFIRMED' && row.status !== 'PENDING') throw { statusCode: 409, message: `Booking is already ${row.status.replace('_',' ').toLowerCase()}` };
+    if (!opts.force && row.ci <= todayStr()) throw { statusCode: 409, message: 'Stay has already started' };
+    await client.query(`UPDATE bookings SET status='CANCELLED' WHERE id=$1`, [row.id]);
+    const keys = nightsOf(row.ci, row.co).map(n => nightKey(row.room_id, n));
+    const remaining = Number(await redis.eval(RELEASE_LUA, keys.length, ...keys, String(row.total_rooms)));
+    await addOutbox(client,'booking.cancelled',row.id,{bookingId:row.id,userId:row.user_id,hotelId:row.hotel_id,roomId:row.room_id,checkIn:row.ci,checkOut:row.co,remaining,forced:!!opts.force});
+    await addOutbox(client,'room.availability.changed',row.room_id,{roomId:row.room_id,checkIn:row.ci,checkOut:row.co,remaining});
+    await client.query('COMMIT');
+    return { bookingId: row.id, status: 'CANCELLED' as const, remaining };
+  } catch(e) { await client.query('ROLLBACK').catch(()=>{}); throw e; } finally { client.release(); }
+}
+
+app.post('/api/bookings/:id/pay', async (req:any, reply) => {
+  await auth(req, ['CUSTOMER']);
+  try { return await payBooking(req.params.id, req.userCtx!.id); }
+  catch (e: any) { if (e?.statusCode) return reply.code(e.statusCode).send({ error: e.message }); throw e; }
+});
+
+app.post('/api/bookings/:id/cancel', async (req:any, reply) => {
+  await auth(req, ['CUSTOMER']);
+  try { return await cancelBooking(req.params.id, { userId: req.userCtx!.id }); }
+  catch (e: any) { if (e?.statusCode) return reply.code(e.statusCode).send({ error: e.message }); throw e; }
+});
+
+// ---- Seller: only their own hotels -------------------------------------
+app.get('/api/seller/hotels', async (req:any) => {
+  await auth(req, ['SELLER']);
+  const r = await pool.query(`
+    SELECT h.id,h.name,h.address,h.city,h.description,
+      (SELECT hp.url FROM hotel_photos hp WHERE hp.hotel_id=h.id LIMIT 1) AS thumbnail,
+      (SELECT count(*)::int FROM rooms r WHERE r.hotel_id=h.id) AS "roomCount",
+      (SELECT count(*)::int FROM bookings b WHERE b.hotel_id=h.id AND b.status IN ('CONFIRMED','PENDING') AND b.check_out > CURRENT_DATE) AS "upcomingBookings",
+      COALESCE((SELECT min(price) FROM rooms r WHERE r.hotel_id=h.id),0) AS "startingPrice"
+    FROM hotels h WHERE h.seller_id=$1 ORDER BY h.created_at DESC`, [req.userCtx!.id]);
+  return r.rows;
+});
+
+// Stat tiles + per-day and per-hotel series for the next N days (default 7, max 31). Source: PostgreSQL bookings.
+app.get('/api/seller/dashboard', async (req:any) => {
+  await auth(req, ['SELLER']);
+  const days = Math.min(31, Math.max(1, Number(req.query.days || 7)));
+  const sid = req.userCtx!.id;
+  const inv = await pool.query(`
+    SELECT count(DISTINCT h.id)::int AS hotels, count(r.id)::int AS "roomTypes", COALESCE(sum(r.total_rooms),0)::int AS inventory
+    FROM hotels h LEFT JOIN rooms r ON r.hotel_id=h.id WHERE h.seller_id=$1`, [sid]);
+  const perDay = await pool.query(`
+    WITH d AS (SELECT generate_series(CURRENT_DATE, CURRENT_DATE + ($2::int - 1), '1 day')::date AS day)
+    SELECT to_char(d.day,'YYYY-MM-DD') AS day,
+      COALESCE((SELECT count(*) FROM bookings b JOIN hotels h ON h.id=b.hotel_id
+                WHERE h.seller_id=$1 AND b.status IN ('CONFIRMED','PENDING') AND b.check_in <= d.day AND b.check_out > d.day),0)::int AS booked,
+      COALESCE((SELECT count(*) FROM bookings b JOIN hotels h ON h.id=b.hotel_id
+                WHERE h.seller_id=$1 AND b.status='PENDING' AND b.check_in <= d.day AND b.check_out > d.day),0)::int AS locked,
+      COALESCE((SELECT count(*) FROM bookings b JOIN hotels h ON h.id=b.hotel_id
+                WHERE h.seller_id=$1 AND b.status='CONFIRMED' AND b.check_in = d.day),0)::int AS arrivals
+    FROM d ORDER BY d.day`, [sid, days]);
+  const perHotel = await pool.query(`
+    SELECT h.id, h.name, h.city,
+      COALESCE((SELECT sum(total_rooms) FROM rooms r WHERE r.hotel_id=h.id),0)::int AS inventory,
+      COALESCE((SELECT sum(LEAST(b.check_out, CURRENT_DATE + $2::int) - GREATEST(b.check_in, CURRENT_DATE))
+                FROM bookings b WHERE b.hotel_id=h.id AND b.status IN ('CONFIRMED','PENDING')
+                AND b.check_in < CURRENT_DATE + $2::int AND b.check_out > CURRENT_DATE),0)::int AS "bookedRoomNights",
+      COALESCE((SELECT count(*) FROM bookings b WHERE b.hotel_id=h.id AND b.status IN ('CONFIRMED','PENDING')
+                AND b.check_in < CURRENT_DATE + $2::int AND b.check_out > CURRENT_DATE),0)::int AS bookings,
+      COALESCE((SELECT sum(b.price) FROM bookings b WHERE b.hotel_id=h.id AND b.status='CONFIRMED'
+                AND b.check_in >= CURRENT_DATE AND b.check_in < CURRENT_DATE + $2::int),0)::numeric AS revenue
+    FROM hotels h WHERE h.seller_id=$1 ORDER BY h.name`, [sid, days]);
+  const inventory = inv.rows[0].inventory;
+  const capacity = inventory * days;
+  const bookedRoomNights = perDay.rows.reduce((a:number,d:any)=>a+d.booked,0);
+  const hotels = perHotel.rows.map((h:any) => {
+    const cap = h.inventory * days;
+    return { ...h, revenue: Number(h.revenue), capacityRoomNights: cap, freeRoomNights: cap - h.bookedRoomNights, occupancyPct: cap ? Math.round(100*h.bookedRoomNights/cap) : 0 };
+  });
+  return {
+    days, from: perDay.rows[0]?.day, to: perDay.rows[perDay.rows.length-1]?.day,
+    tiles: {
+      hotels: inv.rows[0].hotels, roomTypes: inv.rows[0].roomTypes, inventory,
+      bookings: hotels.reduce((a,h)=>a+h.bookings,0),
+      bookedRoomNights, freeRoomNights: capacity - bookedRoomNights, capacityRoomNights: capacity,
+      occupancyPct: capacity ? Math.round(100*bookedRoomNights/capacity) : 0,
+      revenue: hotels.reduce((a,h)=>a+h.revenue,0),
+      arrivalsToday: perDay.rows[0]?.arrivals ?? 0,
+      lockedNow: perDay.rows.reduce((a:number,d:any)=>a+d.locked,0),
+    },
+    perDay: perDay.rows.map((d:any)=>({ ...d, free: Math.max(0, inventory - d.booked) })),
+    hotels,
+  };
+});
+
+app.get('/api/seller/hotels/:id/bookings', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  const h = await pool.query(`SELECT id FROM hotels WHERE id=$1 AND seller_id=$2`, [req.params.id, req.userCtx!.id]);
+  if (!h.rows[0]) return reply.code(404).send({error:'Hotel not found'});
+  const r = await pool.query(`
+    SELECT b.id,b.status,b.price,r.name AS "roomName",u.name AS "customerName",u.email AS "customerEmail",
+      to_char(b.check_in,'YYYY-MM-DD') AS "checkIn", to_char(b.check_out,'YYYY-MM-DD') AS "checkOut", (b.check_out-b.check_in) AS nights
+    FROM bookings b JOIN rooms r ON r.id=b.room_id JOIN users u ON u.id=b.user_id
+    WHERE b.hotel_id=$1 ORDER BY b.check_in DESC, b.created_at DESC`, [req.params.id]);
+  return r.rows;
+});
+
+app.get('/api/admin/users', async (req:any,reply) => {
+  await auth(req,['ADMIN']);
+  const r=await pool.query(`SELECT id,email,name,role FROM users ORDER BY created_at DESC`);
+  return r.rows;
+});
+
+app.post('/api/admin/impersonate/:userId', async (req:any,reply) => {
+  await auth(req,['ADMIN']);
+  const r=await pool.query(`SELECT id,email,name,role FROM users WHERE id=$1`,[req.params.userId]);
+  if(!r.rows[0]) return reply.code(404).send({error:'User not found'});
+  const u=r.rows[0];
+  await pool.query(`INSERT INTO audit_logs(id,actor_user_id,action,target_user_id) VALUES($1,$2,'IMPERSONATION_STARTED',$3)`,
+    [id(),req.userCtx!.id,u.id]);
+  return { token: app.jwt.sign({id:u.id,role:u.role,impersonatedBy:req.userCtx!.id}), user:u };
+});
+
+// Idempotent: re-running it ensures the sample users exist and only creates hotels when there are none yet.
+app.post('/api/admin/sample-data', async (req:any) => {
+  await auth(req,['ADMIN']);
+  const client=await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sampleUsers = [
+      ['seller@example.com','seller123','Sample Seller','SELLER'],
+      ['seller2@example.com','seller123','Sample Seller 2','SELLER'],
+      ['customer@example.com','customer123','Sample Customer','CUSTOMER'],
+      ['customer2@example.com','customer123','Sample Customer 2','CUSTOMER'],
+    ];
+    const ids: Record<string,string> = {};
+    for (const [email,pw,name,role] of sampleUsers) {
+      const r = await client.query(
+        `INSERT INTO users(id,email,password_hash,name,role,is_sample) VALUES($1,$2,$3,$4,$5,true)
+         ON CONFLICT (email) DO UPDATE SET is_sample=true RETURNING id`, [id(),email,pw,name,role]);
+      ids[email] = r.rows[0].id;
+    }
+    const existing = await client.query(`SELECT count(*)::int AS n FROM hotels WHERE is_sample=true`);
+    let hotelsCreated = 0;
+    if (existing.rows[0].n > 0) {
+      // Databases seeded before seller2 existed: hand even-numbered sample hotels to seller2.
+      await client.query(`UPDATE hotels SET seller_id=$1 WHERE is_sample=true AND seller_id=$2 AND (regexp_replace(name,'\\D','','g'))::int % 2 = 0`,
+        [ids['seller2@example.com'], ids['seller@example.com']]);
+    } else {
+      const cities=['Bangkok','Chiang Mai','Phuket','Pattaya','Hua Hin'];
+      for(let i=1;i<=20;i++){
+        const hid=id();
+        await client.query(`INSERT INTO hotels(id,seller_id,name,address,city,description,is_sample) VALUES($1,$2,$3,$4,$5,$6,true)`,
+          [hid,ids[i%2?'seller@example.com':'seller2@example.com'],`Sample Hotel ${i}`,`${i} Riverside Road`,cities[i%cities.length],'A sample hotel for learning the booking architecture.']);
+        await client.query(`INSERT INTO hotel_photos(id,hotel_id,url) VALUES($1,$2,$3)`,
+          [id(),hid,`https://picsum.photos/seed/hotel${i}/900/600`]);
+        for(let j=1;j<=3;j++){
+          // Availability keys are created lazily per night from total_rooms.
+          await client.query(`INSERT INTO rooms(id,hotel_id,name,price,total_rooms,is_sample) VALUES($1,$2,$3,$4,$5,true)`,
+            [id(),hid,`Room Type ${j}`,1000+i*50+j*100,3+j]);
+        }
+        hotelsCreated++;
+      }
+    }
+    await client.query('COMMIT');
+    return {ok:true,
+      message: hotelsCreated ? `Sample data generated (${hotelsCreated} hotels, 4 users)` : 'Sample users ensured; sample hotels already existed',
+      login:{customer:'customer@example.com / customer123',customer2:'customer2@example.com / customer123',seller:'seller@example.com / seller123',seller2:'seller2@example.com / seller123'}};
+  } catch(e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+});
+
+// Creates a few future bookings for ONE customer. Two of them overlap on purpose so the
+// "double booking" notice in My bookings can be seen. Uses the same Redis reservation path as real bookings.
+app.post('/api/admin/sample-bookings', async (req:any, reply) => {
+  await auth(req,['ADMIN']);
+  const { userId } = req.body || {};
+  const u = await pool.query(`SELECT id,role,email FROM users WHERE id=$1`, [userId]);
+  if (!u.rows[0]) return reply.code(404).send({ error: 'User not found' });
+  if (u.rows[0].role !== 'CUSTOMER') return reply.code(400).send({ error: 'Sample bookings can only be created for CUSTOMER users' });
+  const rooms = await pool.query(`SELECT r.*, h.name AS hotel_name FROM rooms r JOIN hotels h ON h.id=r.hotel_id ORDER BY random() LIMIT 5`);
+  if (rooms.rows.length < 5) return reply.code(409).send({ error: 'Generate sample data first' });
+  const t = todayStr();
+  const plans = [
+    { room: rooms.rows[0], checkIn: addDays(t, 2),  checkOut: addDays(t, 5) },
+    { room: rooms.rows[1], checkIn: addDays(t, 4),  checkOut: addDays(t, 6) },   // overlaps the first stay
+    { room: rooms.rows[2], checkIn: addDays(t, 10), checkOut: addDays(t, 12) },
+    { room: rooms.rows[3], checkIn: t,              checkOut: addDays(t, 2) },   // "Staying now"
+  ];
+  // A completed stay from last week, inserted directly: past nights are not tracked in Redis.
+  const past = rooms.rows[4];
+  await pool.query(
+    `INSERT INTO bookings(id,user_id,hotel_id,room_id,status,price,check_in,check_out,paid_at)
+     VALUES($1,$2,$3,$4,'CONFIRMED',$5,$6,$7,now() - interval '10 days')`,
+    [id(), userId, past.hotel_id, past.id, Number(past.price) * 3, addDays(t, -7), addDays(t, -4)]);
+  const created: any[] = [], skipped: any[] = [];
+  for (const pl of plans) {
+    const range = parseRange(pl.checkIn, pl.checkOut);
+    if ('error' in range) continue;
+    try {
+      const b = await createBooking(userId, pl.room, pl.checkIn, pl.checkOut, range.nights, 'CONFIRMED');
+      created.push({ ...b, hotel: pl.room.hotel_name, room: pl.room.name });
+    } catch (e: any) {
+      if (e?.statusCode === 409) skipped.push({ hotel: pl.room.hotel_name, room: pl.room.name, reason: e.message }); else throw e;
+    }
+  }
+  await pool.query(`INSERT INTO audit_logs(id,actor_user_id,action,target_user_id,metadata) VALUES($1,$2,'SAMPLE_BOOKINGS_CREATED',$3,$4)`,
+    [id(), req.userCtx!.id, userId, JSON.stringify({ created: created.length, skipped: skipped.length })]);
+  created.push({ bookingId: null, status: 'CONFIRMED', checkIn: addDays(t, -7), checkOut: addDays(t, -4), hotel: past.hotel_name, room: past.name, completed: true });
+  return { ok:true, message:`Created ${created.length} sample booking(s) for ${u.rows[0].email} (upcoming, overlapping, current and completed stays)${skipped.length?`, ${skipped.length} skipped (sold out)`:''}`, created, skipped };
+});
+
+// ---- Load simulation -------------------------------------------------------
+// N throw-away customers book random rooms for the coming week at the same instant. A share pays at once,
+// a share is "late" (lets the lock expire, then rebooks and pays), the rest abandon. Everything is timed so
+// the report shows where the time goes (Redis lock, PostgreSQL write, outbox->Kafka lag, expiry worker).
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const timed = async <T,>(fn: () => Promise<T>) => {
+  const t = performance.now();
+  try { const value = await fn(); return { ok: true as const, ms: performance.now()-t, value }; }
+  catch (e: any) { return { ok: false as const, ms: performance.now()-t, error: e }; }
+};
+function stats(ms: number[]) {
+  if (!ms.length) return { count: 0, avgMs: 0, p50Ms: 0, p95Ms: 0, maxMs: 0 };
+  const a = [...ms].sort((x,y)=>x-y); const q = (p:number) => a[Math.min(a.length-1, Math.floor(p*a.length))];
+  return { count: a.length, avgMs: +(a.reduce((x,y)=>x+y,0)/a.length).toFixed(1), p50Ms: +q(0.5).toFixed(1), p95Ms: +q(0.95).toFixed(1), maxMs: +a[a.length-1].toFixed(1) };
+}
+const running = new Set<string>();
+
+type SimParams = { mode: 'random-week'|'same-room-fallback'; customers: number; payRatio: number; lateRatio: number; windowSeconds: number; roomId?: string };
+function simContext(runId: string) {
+  const started = Date.now(); const log: string[] = [];
+  const note = (m: string) => { log.push(`${((Date.now()-started)/1000).toFixed(1)}s ${m}`); app.log.info({ runId }, m); };
+  const save = async (status: string, report: any) =>
+    pool.query(`UPDATE simulation_runs SET status=$2, report=$3, finished_at=CASE WHEN $2 IN ('DONE','FAILED') THEN now() END WHERE id=$1`, [runId, status, JSON.stringify({ ...report, log })]);
+  return { started, log, note, save };
+}
+async function simCreateCustomers(runId: string, n: number) {
+  const short = runId.slice(0, 8);
+  const values: any[] = []; const rowsSql: string[] = [];
+  for (let i = 1; i <= n; i++) { values.push(id(), `sim-${short}-${i}@example.com`, 'sim123', `Sim ${short} #${i}`); rowsSql.push(`($${values.length-3},$${values.length-2},$${values.length-1},$${values.length},'CUSTOMER',true)`); }
+  const users = await pool.query(`INSERT INTO users(id,email,password_hash,name,role,is_sample) VALUES ${rowsSql.join(',')} RETURNING id`, values);
+  const customerIds: string[] = users.rows.map((u:any)=>u.id);
+  await pool.query(`UPDATE simulation_runs SET customer_ids=$2 WHERE id=$1`, [runId, customerIds]);
+  return customerIds;
+}
+/** Waits (max 30s) for this run's outbox events to reach Kafka and returns lag stats. */
+async function simOutbox(started: number, note: (m: string) => void) {
+  const drainStart = Date.now(); let pendingEvents = 1;
+  while (pendingEvents > 0 && Date.now() - drainStart < 30000) {
+    await sleep(500);
+    pendingEvents = (await pool.query(`SELECT count(*)::int AS n FROM outbox_events WHERE created_at >= to_timestamp($1/1000.0) AND published_at IS NULL`, [started])).rows[0].n;
+  }
+  const drainMs = Date.now() - drainStart;
+  note(`outbox drained in ${(drainMs/1000).toFixed(1)}s (${pendingEvents} events still unpublished)`);
+  const lag = await pool.query(`
+    SELECT count(*)::int AS events, count(published_at)::int AS published,
+      COALESCE(avg(EXTRACT(EPOCH FROM (published_at-created_at))*1000),0)::float AS "avgMs",
+      COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (published_at-created_at))*1000),0)::float AS "p95Ms",
+      COALESCE(max(EXTRACT(EPOCH FROM (published_at-created_at))*1000),0)::float AS "maxMs"
+    FROM outbox_events WHERE created_at >= to_timestamp($1/1000.0)`, [started]);
+  return { ...lag.rows[0], avgMs: +lag.rows[0].avgMs.toFixed(0), p95Ms: +lag.rows[0].p95Ms.toFixed(0), maxMs: +lag.rows[0].maxMs.toFixed(0), drainMs, unpublished: pendingEvents };
+}
+async function simFinalStatuses(customerIds: string[]) {
+  const final = await pool.query(`SELECT status, count(*)::int FROM bookings WHERE user_id = ANY($1) GROUP BY status`, [customerIds]);
+  return Object.fromEntries(final.rows.map((r:any)=>[r.status, r.count]));
+}
+
+// Mode 2: everyone wants the SAME room for 7 nights. Fallback 1: another room type in the same hotel.
+// Fallback 2: another hotel (up to 3 tried). Winners pay immediately. Shows how a crowd cascades through inventory.
+async function runSameRoomSimulation(runId: string, params: SimParams) {
+  const { started, log, note, save } = simContext(runId);
+  try {
+    const customerIds = await simCreateCustomers(runId, params.customers);
+    note(`created ${customerIds.length} customers`);
+    const rooms = (await pool.query(`SELECT r.*, h.name AS hotel_name, h.city FROM rooms r JOIN hotels h ON h.id=r.hotel_id ORDER BY h.name, r.price`)).rows;
+    const target = rooms.find(r => r.id === params.roomId) || rooms[0];
+    if (!target) throw new Error('No rooms exist. Generate sample data first.');
+    const t = todayStr(), checkIn = t, checkOut = addDays(t, 7);
+    const range = parseRange(checkIn, checkOut); if ('error' in range) throw new Error(range.error);
+    const sameHotelOthers = rooms.filter(r => r.hotel_id === target.hotel_id && r.id !== target.id);
+    const otherHotelIds = [...new Set(rooms.filter(r => r.hotel_id !== target.hotel_id).map(r => r.hotel_id))];
+    const shuffle = <T,>(a: T[]) => { const b = [...a]; for (let i = b.length-1; i > 0; i--) { const j = Math.floor(Math.random()*(i+1)); [b[i], b[j]] = [b[j], b[i]]; } return b; };
+    const timings: Record<string, number[]> = { targetRoom: [], sameHotelOtherRoom: [], otherHotel: [], pay: [] };
+    const tiers: Record<string, number> = { targetRoom: 0, sameHotelOtherRoom: 0, otherHotel: 0, noRoom: 0 };
+    const attemptsPerTier: Record<string, number> = { targetRoom: 0, sameHotelOtherRoom: 0, otherHotel: 0 };
+    const won: Record<string, number> = {}; let paid = 0, payFailed = 0, errors = 0;
+    type Outcome = { tier: string; attempts: number; room?: string };
+    const attempt = async (userId: string, room: any, tier: string) => {
+      attemptsPerTier[tier]++;
+      const r = await timed(() => createBooking(userId, room, checkIn, checkOut, range.nights, 'PENDING', params.windowSeconds));
+      timings[tier].push(r.ms);
+      if (!r.ok && r.error?.statusCode !== 409) { errors++; app.log.error(r.error); }
+      return r.ok ? r.value : null;
+    };
+    const flow = async (userId: string): Promise<Outcome> => {
+      let attempts = 0; let b = await attempt(userId, target, 'targetRoom'); attempts++;
+      let tier = 'targetRoom', room = `${target.hotel_name} / ${target.name}`;
+      if (!b) { tier = 'sameHotelOtherRoom'; for (const r of shuffle(sameHotelOthers)) { b = await attempt(userId, r, tier); attempts++; if (b) { room = `${r.hotel_name} / ${r.name}`; break; } } }
+      if (!b) { tier = 'otherHotel'; outer: for (const hid of shuffle(otherHotelIds).slice(0, 3)) { for (const r of shuffle(rooms.filter(x => x.hotel_id === hid))) { b = await attempt(userId, r, tier); attempts++; if (b) { room = `${r.hotel_name} / ${r.name}`; break outer; } } } }
+      if (!b) return { tier: 'noRoom', attempts };
+      const p = await timed(() => payBooking(b.bookingId, userId)); timings.pay.push(p.ms); if (p.ok) paid++; else payFailed++;
+      return { tier, attempts, room };
+    };
+    const burstStart = performance.now();
+    const outcomes = await Promise.all(customerIds.map(flow));
+    const burstMs = performance.now() - burstStart;
+    for (const o of outcomes) { tiers[o.tier]++; if (o.room) won[o.room] = (won[o.room]||0) + 1; }
+    const totalAttempts = outcomes.reduce((a,o)=>a+o.attempts,0);
+    note(`cascade done in ${burstMs.toFixed(0)}ms: ${tiers.targetRoom} got the target room, ${tiers.sameHotelOtherRoom} another room in the hotel, ${tiers.otherHotel} another hotel, ${tiers.noRoom} nothing`);
+    const outbox = await simOutbox(started, note);
+    const ops: Record<string, any> = {
+      'Target room attempt': stats(timings.targetRoom), 'Same-hotel other room attempt': stats(timings.sameHotelOtherRoom),
+      'Other-hotel attempt': stats(timings.otherHotel), 'Pay request': stats(timings.pay),
+    };
+    const bottlenecks = [
+      ...Object.entries(ops).filter(([,v]) => v.count).map(([name, v]) => ({ step: name, p95Ms: v.p95Ms, note: '' })),
+      { step: 'Outbox -> Kafka publish lag (insert to publish)', p95Ms: outbox.p95Ms, note: `publisher polls every 1.5s, one Kafka send per event; ${outbox.events} events drained in ${(outbox.drainMs/1000).toFixed(1)}s` },
+    ].sort((a,b)=>b.p95Ms-a.p95Ms);
+    await save('DONE', {
+      params, mode: params.mode, customers: customerIds.length, durationMs: Date.now()-started, burstMs: +burstMs.toFixed(0),
+      throughputPerSec: +(totalAttempts / (burstMs/1000)).toFixed(1),
+      target: { hotel: target.hotel_name, city: target.city, room: target.name, totalRooms: target.total_rooms, checkIn, checkOut, nights: 7,
+        sameHotelOtherRooms: sameHotelOthers.length, sameHotelOtherCapacity: sameHotelOthers.reduce((a,r)=>a+r.total_rooms,0), otherHotels: otherHotelIds.length },
+      tiers, attemptsPerTier, totalAttempts, avgAttemptsPerCustomer: +(totalAttempts / customerIds.length).toFixed(2),
+      counts: { bookAttempts: totalAttempts, locked: customerIds.length - tiers.noRoom, soldOut: tiers.noRoom, paid, payFailed, errors, timedOut: 0, late: 0, abandoned: 0, rebooked: 0, rebookSoldOut: 0 },
+      roomsWon: Object.entries(won).map(([room,count])=>({room,count})).sort((a:any,b:any)=>b.count-a.count),
+      outcomes: [
+        { outcome: `got the target room (${target.hotel_name} / ${target.name})`, count: tiers.targetRoom },
+        { outcome: 'target sold out -> another room in the same hotel', count: tiers.sameHotelOtherRoom },
+        { outcome: 'hotel sold out -> another hotel', count: tiers.otherHotel },
+        { outcome: 'no room found (3 other hotels tried)', count: tiers.noRoom },
+      ],
+      finalStatuses: await simFinalStatuses(customerIds), timings: ops, outbox, bottlenecks, progressPct: 100,
+    });
+    note('done');
+  } catch (e: any) { app.log.error(e); await save('FAILED', { error: e?.message || String(e), progressPct: 100 }); }
+  finally { running.delete(runId); }
+}
+
+async function runSimulation(runId: string, params: SimParams) {
+  const { started, log, note, save } = simContext(runId);
+  try {
+    const customerIds = await simCreateCustomers(runId, params.customers);
+    note(`created ${customerIds.length} customers`);
+    const rooms = (await pool.query(`SELECT r.*, h.name AS hotel_name FROM rooms r JOIN hotels h ON h.id=r.hotel_id`)).rows;
+    if (!rooms.length) throw new Error('No rooms exist. Generate sample data first.');
+    const t = todayStr();
+    const pick = () => { const room = rooms[Math.floor(Math.random()*rooms.length)]; const start = Math.floor(Math.random()*7); const nights = 1 + Math.floor(Math.random()*Math.min(3, 7-start)); return { room, checkIn: addDays(t, start), checkOut: addDays(t, start+nights) }; };
+    type Actor = { userId: string; plan: ReturnType<typeof pick>; behavior: 'pay'|'late'|'abandon'|'none'; bookingId?: string; expiresAt?: string; outcome: string; };
+    const actors: Actor[] = customerIds.map(uid => ({ userId: uid, plan: pick(), behavior: 'none', outcome: '' }));
+    const timings: Record<string, number[]> = { book: [], bookRedis: [], bookPg: [], bookRejected: [], pay: [], rebook: [], rebookPay: [], retryOtherRoom: [] };
+    const counts: Record<string, number> = { bookAttempts: 0, locked: 0, soldOut: 0, retryOtherRoom: 0, retrySucceeded: 0, paid: 0, payFailed: 0, late: 0, timedOut: 0, rebookAttempts: 0, rebooked: 0, rebookSoldOut: 0, abandoned: 0, errors: 0 };
+    const book = async (a: Actor, plan = a.plan, bucket = 'book') => {
+      const range = parseRange(plan.checkIn, plan.checkOut); if ('error' in range) throw new Error(range.error);
+      const r = await timed(() => createBooking(a.userId, plan.room, plan.checkIn, plan.checkOut, range.nights, 'PENDING', params.windowSeconds));
+      timings[bucket].push(r.ms);
+      if (r.ok) { a.bookingId = r.value.bookingId; a.expiresAt = r.value.expiresAt; if (bucket==='book') { timings.bookRedis.push(r.value.timings.redisMs); timings.bookPg.push(r.value.timings.pgMs); } return true; }
+      if (r.error?.statusCode !== 409) { counts.errors++; app.log.error(r.error); } else if (bucket==='book') timings.bookRejected.push(r.ms);
+      return false;
+    };
+    // 2. everyone books at once
+    const burstStart = performance.now();
+    const results = await Promise.all(actors.map(a => book(a)));
+    const burstMs = performance.now() - burstStart;
+    counts.bookAttempts = actors.length; counts.locked = results.filter(Boolean).length; counts.soldOut = actors.length - counts.locked;
+    note(`burst: ${counts.locked} locked, ${counts.soldOut} sold out in ${burstMs.toFixed(0)}ms`);
+    // 2b. sold-out customers try one other room
+    const soldOut = actors.filter(a => !a.bookingId);
+    await Promise.all(soldOut.map(async a => { counts.retryOtherRoom++; a.plan = pick(); if (await book(a, a.plan, 'retryOtherRoom')) counts.retrySucceeded++; else a.outcome = 'sold out twice'; }));
+    // 3. behaviours
+    const holders = actors.filter(a => a.bookingId); for (let i = holders.length-1; i > 0; i--) { const j = Math.floor(Math.random()*(i+1)); [holders[i], holders[j]] = [holders[j], holders[i]]; }
+    const nPay = Math.round(holders.length * params.payRatio), nLate = Math.round(holders.length * params.lateRatio);
+    holders.forEach((a, i) => a.behavior = i < nPay ? 'pay' : i < nPay + nLate ? 'late' : 'abandon');
+    const payers = holders.filter(a => a.behavior==='pay');
+    await Promise.all(payers.map(async a => { const r = await timed(() => payBooking(a.bookingId!, a.userId)); timings.pay.push(r.ms); if (r.ok) { counts.paid++; a.outcome = 'paid'; } else { counts.payFailed++; a.outcome = 'pay failed: ' + (r.error?.message||'error'); } }));
+    note(`${counts.paid} paid immediately`);
+    // 4. late + abandon: wait for the expiry worker
+    const waiting = holders.filter(a => a.behavior !== 'pay'); counts.late = holders.filter(a => a.behavior==='late').length; counts.abandoned = holders.filter(a => a.behavior==='abandon').length;
+    await save('RUNNING', { phase: `waiting ${params.windowSeconds}s for ${waiting.length} locks to expire`, counts, progressPct: 50 });
+    const expiryLatency: number[] = []; const deadline = Date.now() + (params.windowSeconds + 15) * 1000;
+    const pendingIds = new Set(waiting.map(a => a.bookingId!));
+    while (pendingIds.size && Date.now() < deadline) {
+      await sleep(500);
+      const r = await pool.query(`SELECT id, status, expires_at FROM bookings WHERE id = ANY($1) AND status <> 'PENDING'`, [[...pendingIds]]);
+      for (const row of r.rows) { pendingIds.delete(row.id); if (row.status==='PAYMENT_TIMEOUT') { counts.timedOut++; expiryLatency.push(Date.now() - new Date(row.expires_at).getTime()); } }
+    }
+    note(`${counts.timedOut} locks timed out (${pendingIds.size} still pending)`);
+    // 5. late customers come back: rebook the same room/dates, then pay
+    const late = holders.filter(a => a.behavior==='late');
+    await Promise.all(late.map(async a => {
+      counts.rebookAttempts++;
+      if (await book(a, a.plan, 'rebook')) { counts.rebooked++; const r = await timed(() => payBooking(a.bookingId!, a.userId)); timings.rebookPay.push(r.ms); a.outcome = r.ok ? 'late, rebooked and paid' : 'late, rebooked, pay failed'; if (r.ok) counts.paid++; }
+      else { counts.rebookSoldOut++; a.outcome = 'late, room gone on rebook'; }
+    }));
+    holders.filter(a => a.behavior==='abandon').forEach(a => a.outcome = 'abandoned (timed out)');
+    note(`late customers: ${counts.rebooked} rebooked, ${counts.rebookSoldOut} lost the room`);
+    const outbox = await simOutbox(started, note);
+    // 7. bottleneck ranking: which step costs the most (p95)
+    const ops: Record<string, any> = {
+      'Redis lock (Lua reserve)': stats(timings.bookRedis), 'PostgreSQL booking write (tx + outbox rows)': stats(timings.bookPg),
+      'Book request end-to-end': stats(timings.book), 'Rejected (sold out) request': stats(timings.bookRejected), 'Pay request': stats(timings.pay),
+      'Retry on another room': stats(timings.retryOtherRoom), 'Rebook after timeout': stats(timings.rebook), 'Pay after rebook': stats(timings.rebookPay),
+    };
+    const expiry = stats(expiryLatency);
+    const bottlenecks = [
+      ...Object.entries(ops).filter(([,v]) => v.count).map(([name, v]) => ({ step: name, p95Ms: v.p95Ms, note: '' })),
+      { step: 'Outbox -> Kafka publish lag (insert to publish)', p95Ms: outbox.p95Ms, note: `publisher polls every 1.5s, 50 rows per poll, one Kafka send per event; ${outbox.events} events drained in ${(outbox.drainMs/1000).toFixed(1)}s` },
+      { step: 'Payment-timeout worker delay after expiry', p95Ms: expiry.p95Ms, note: 'worker polls every 2s (measured with 0.5s sampling)' },
+    ].sort((a,b)=>b.p95Ms-a.p95Ms);
+    const report = {
+      params, mode: params.mode, customers: customerIds.length, durationMs: Date.now()-started, burstMs: +burstMs.toFixed(0),
+      throughputPerSec: +(counts.bookAttempts / (burstMs/1000)).toFixed(1),
+      counts, finalStatuses: await simFinalStatuses(customerIds),
+      timings: ops, outbox, expiryWorker: expiry, bottlenecks,
+      redisShareOfBookPct: timings.book.length ? Math.round(100 * timings.bookRedis.reduce((a,b)=>a+b,0) / timings.book.reduce((a,b)=>a+b,0)) : 0,
+      pgShareOfBookPct: timings.book.length ? Math.round(100 * timings.bookPg.reduce((a,b)=>a+b,0) / timings.book.reduce((a,b)=>a+b,0)) : 0,
+      outcomes: Object.entries(actors.reduce((m:Record<string,number>, a) => { const k = a.outcome || (a.bookingId ? 'holding lock' : 'no booking'); m[k]=(m[k]||0)+1; return m; }, {})).map(([outcome,count])=>({outcome,count})).sort((a:any,b:any)=>b.count-a.count),
+      progressPct: 100,
+    };
+    await save('DONE', report); note('done');
+  } catch (e: any) {
+    app.log.error(e); await save('FAILED', { error: e?.message || String(e), progressPct: 100 });
+  } finally { running.delete(runId); }
+}
+
+app.post('/api/admin/simulation', async (req:any, reply) => {
+  await auth(req,['ADMIN']);
+  if (running.size) return reply.code(409).send({ error: 'A simulation is already running' });
+  const b = req.body || {};
+  const params: SimParams = {
+    mode: b.mode === 'same-room-fallback' ? 'same-room-fallback' : 'random-week',
+    customers: Math.min(500, Math.max(1, Number(b.customers ?? 100))),
+    payRatio: Math.min(1, Math.max(0, Number(b.payRatio ?? 0.5))),
+    lateRatio: Math.min(1, Math.max(0, Number(b.lateRatio ?? 0.3))),
+    windowSeconds: Math.min(60, Math.max(3, Number(b.windowSeconds ?? 5))),
+    roomId: b.roomId || undefined,
+  };
+  if (params.payRatio + params.lateRatio > 1) return reply.code(400).send({ error: 'payRatio + lateRatio must be <= 1' });
+  if (params.mode === 'same-room-fallback') {
+    if (!params.roomId) return reply.code(400).send({ error: 'roomId is required for the same-room simulation' });
+    const r = await pool.query(`SELECT id FROM rooms WHERE id=$1`, [params.roomId]); if (!r.rows[0]) return reply.code(404).send({ error: 'Room not found' });
+  }
+  const runId = id();
+  await pool.query(`INSERT INTO simulation_runs(id, status, params, report, created_by) VALUES($1,'RUNNING',$2,'{}',$3)`, [runId, JSON.stringify(params), req.userCtx!.id]);
+  running.add(runId);
+  (params.mode === 'same-room-fallback' ? runSameRoomSimulation : runSimulation)(runId, params); // fire and forget; poll GET /api/admin/simulation/:id
+  return { runId, status: 'RUNNING', params };
+});
+app.get('/api/admin/simulation', async (req:any) => {
+  await auth(req,['ADMIN']);
+  const r = await pool.query(`SELECT id, status, params, created_at AS "createdAt", finished_at AS "finishedAt", cardinality(customer_ids) AS customers,
+    (SELECT count(*)::int FROM bookings WHERE user_id = ANY(customer_ids) AND status IN ('CONFIRMED','PENDING')) AS "activeBookings"
+    FROM simulation_runs ORDER BY created_at DESC LIMIT 10`);
+  return r.rows;
+});
+app.get('/api/admin/simulation/:id', async (req:any, reply) => {
+  await auth(req,['ADMIN']);
+  const r = await pool.query(`SELECT id, status, params, report, created_at AS "createdAt", finished_at AS "finishedAt", cardinality(customer_ids) AS customers,
+    (SELECT count(*)::int FROM bookings WHERE user_id = ANY(customer_ids) AND status IN ('CONFIRMED','PENDING')) AS "activeBookings"
+    FROM simulation_runs WHERE id=$1`, [req.params.id]);
+  if (!r.rows[0]) return reply.code(404).send({ error: 'Run not found' });
+  return r.rows[0];
+});
+// Cancels every active booking made by this run's customers (admin force: stay-started rule does not apply).
+app.post('/api/admin/simulation/:id/cancel-all', async (req:any, reply) => {
+  await auth(req,['ADMIN']);
+  const run = await pool.query(`SELECT customer_ids FROM simulation_runs WHERE id=$1`, [req.params.id]);
+  if (!run.rows[0]) return reply.code(404).send({ error: 'Run not found' });
+  const ids = (await pool.query(`SELECT id FROM bookings WHERE user_id = ANY($1) AND status IN ('CONFIRMED','PENDING')`, [run.rows[0].customer_ids || []])).rows.map((r:any)=>r.id);
+  let cancelled = 0, failed = 0; const t0 = performance.now();
+  for (const bid of ids) { try { await cancelBooking(bid, { force: true }); cancelled++; } catch (e:any) { failed++; if (!e?.statusCode) app.log.error(e); } }
+  await pool.query(`INSERT INTO audit_logs(id,actor_user_id,action,metadata) VALUES($1,$2,'SIMULATION_CANCEL_ALL',$3)`, [id(), req.userCtx!.id, JSON.stringify({ runId: req.params.id, cancelled, failed })]);
+  return { ok: true, cancelled, failed, durationMs: Math.round(performance.now()-t0), message: `Cancelled ${cancelled} booking(s) of this run's customers${failed?`, ${failed} failed`:''}` };
+});
+
+// Concurrency demo: every customer tries to book the same room for the same dates at the same instant.
+// The Redis Lua reservation decides who gets a room; the rest get "No rooms available".
+app.post('/api/admin/concurrent-booking', async (req:any, reply) => {
+  await auth(req,['ADMIN']);
+  const { roomId, checkIn, checkOut, confirm } = req.body || {};
+  const range = parseRange(checkIn, checkOut);
+  if ('error' in range) return reply.code(400).send({ error: range.error });
+  const room = await pool.query(`SELECT r.*, h.name AS hotel_name FROM rooms r JOIN hotels h ON h.id=r.hotel_id WHERE r.id=$1`, [roomId]);
+  if (!room.rows[0]) return reply.code(404).send({ error: 'Room not found' });
+  const r = room.rows[0];
+  const customers = await pool.query(`SELECT id,name,email FROM users WHERE role='CUSTOMER' ORDER BY created_at`);
+  if (!customers.rows.length) return reply.code(409).send({ error: 'No customers exist yet' });
+  const before = await availabilityFor(r.id, r.total_rooms, range.nights);
+  const startedAt = Date.now();
+  const settled = await Promise.allSettled(customers.rows.map((c:any) =>
+    createBooking(c.id, r, checkIn, checkOut, range.nights, confirm ? 'CONFIRMED' : 'PENDING')));
+  const durationMs = Date.now() - startedAt;
+  const results = settled.map((x, i) => {
+    const c = customers.rows[i];
+    if (x.status === 'fulfilled') return { customer: c.name, email: c.email, ok: true, bookingId: x.value.bookingId, status: x.value.status, remaining: x.value.remaining, expiresAt: x.value.expiresAt };
+    const e: any = x.reason;
+    if (e?.statusCode !== 409) app.log.error(e);
+    return { customer: c.name, email: c.email, ok: false, error: e?.statusCode === 409 ? e.message : 'Internal error' };
+  });
+  const after = await availabilityFor(r.id, r.total_rooms, range.nights);
+  const won = results.filter(x => x.ok).length;
+  await pool.query(`INSERT INTO audit_logs(id,actor_user_id,action,metadata) VALUES($1,$2,'CONCURRENT_BOOKING_DEMO',$3)`,
+    [id(), req.userCtx!.id, JSON.stringify({ roomId, checkIn, checkOut, customers: customers.rows.length, won, before, after, confirm: !!confirm })]);
+  return {
+    ok: true,
+    message: `${customers.rows.length} customers booked "${r.hotel_name} / ${r.name}" at once: ${won} got a room, ${results.length - won} were rejected. Availability ${before} -> ${after}.`,
+    hotel: r.hotel_name, room: r.name, checkIn, checkOut, availabilityBefore: before, availabilityAfter: after, durationMs, results,
+  };
+});
+
+app.delete('/api/admin/sample-data', async (req:any) => {
+  await auth(req,['ADMIN']);
+  await pool.query(`DELETE FROM bookings WHERE user_id IN (SELECT id FROM users WHERE is_sample=true) OR room_id IN (SELECT id FROM rooms WHERE is_sample=true)`);
+  await pool.query(`DELETE FROM hotel_photos WHERE hotel_id IN (SELECT id FROM hotels WHERE is_sample=true)`);
+  const rooms=await pool.query(`SELECT id FROM rooms WHERE is_sample=true`);
+  for(const r of rooms.rows) await deleteRoomAvailability(r.id);
+  await pool.query(`DELETE FROM rooms WHERE is_sample=true`);
+  await pool.query(`DELETE FROM hotels WHERE is_sample=true`);
+  await pool.query(`DELETE FROM users WHERE is_sample=true`);
+  await pool.query(`DELETE FROM simulation_runs`);
+  return {ok:true,message:'Sample data deleted (including simulation customers and runs)'};
+});
+
+async function outboxLoop() {
+  while(true) {
+    try {
+      const r=await pool.query(`SELECT * FROM outbox_events WHERE published_at IS NULL ORDER BY id LIMIT 50`);
+      for(const e of r.rows) {
+        await producer.send({topic:e.topic,messages:[{key:e.event_key,value:JSON.stringify(e.payload)}]});
+        await pool.query(`UPDATE outbox_events SET published_at=NOW() WHERE id=$1`,[e.id]);
+      }
+    } catch(err) { app.log.error(err); }
+    await new Promise(r=>setTimeout(r,1500));
+  }
+}
+
+// Releases rooms whose payment window passed: PENDING -> PAYMENT_TIMEOUT, nights back to Redis, events out.
+async function expirePendingBookings() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(`
+      WITH due AS (
+        SELECT id FROM bookings WHERE status='PENDING' AND expires_at <= now() FOR UPDATE SKIP LOCKED LIMIT 100)
+      UPDATE bookings b SET status='PAYMENT_TIMEOUT' FROM due, rooms r
+      WHERE b.id=due.id AND r.id=b.room_id
+      RETURNING b.id, b.user_id, b.hotel_id, b.room_id, r.total_rooms,
+        to_char(b.check_in,'YYYY-MM-DD') AS ci, to_char(b.check_out,'YYYY-MM-DD') AS co`);
+    for (const row of r.rows) {
+      const keys = nightsOf(row.ci, row.co).map(n => nightKey(row.room_id, n));
+      const remaining = Number(await redis.eval(RELEASE_LUA, keys.length, ...keys, String(row.total_rooms)));
+      await addOutbox(client,'booking.payment_timeout',row.id,{bookingId:row.id,userId:row.user_id,hotelId:row.hotel_id,roomId:row.room_id,checkIn:row.ci,checkOut:row.co,remaining});
+      await addOutbox(client,'room.availability.changed',row.room_id,{roomId:row.room_id,checkIn:row.ci,checkOut:row.co,remaining});
+      app.log.info({ bookingId: row.id, remaining }, 'booking payment timed out, room released');
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+async function expiryLoop() {
+  while (true) {
+    try { await expirePendingBookings(); } catch (err) { app.log.error(err); }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+// Redis is a cache of PostgreSQL truth: recompute every future night that has active bookings.
+// Run at startup (Redis may have restarted empty) and on demand from the admin panel.
+async function rebuildAvailability() {
+  const t0 = performance.now();
+  const r = await pool.query(`
+    SELECT b.room_id, r.total_rooms, to_char(d.night,'YYYY-MM-DD') AS night, count(*)::int AS booked
+    FROM bookings b JOIN rooms r ON r.id=b.room_id
+    CROSS JOIN LATERAL generate_series(GREATEST(b.check_in, CURRENT_DATE), b.check_out - 1, '1 day') AS d(night)
+    WHERE b.status IN ('CONFIRMED','PENDING') AND b.check_out > CURRENT_DATE
+    GROUP BY b.room_id, r.total_rooms, d.night`);
+  const stale = await redis.keys('availability:*');
+  const pipe = redis.pipeline();
+  if (stale.length) pipe.del(...stale);                         // nights without bookings fall back to total_rooms lazily
+  for (const row of r.rows) pipe.set(nightKey(row.room_id, row.night), String(Math.max(0, row.total_rooms - row.booked)));
+  await pipe.exec();
+  const oversold = r.rows.filter((x:any) => x.booked > x.total_rooms).length;
+  const summary = { roomNights: r.rows.length, staleKeysDropped: stale.length, oversoldRoomNights: oversold, ms: Math.round(performance.now() - t0) };
+  app.log.info(summary, 'availability rebuilt from PostgreSQL');
+  return summary;
+}
+app.post('/api/admin/rebuild-availability', async (req:any) => {
+  await auth(req,['ADMIN']);
+  const summary = await rebuildAvailability();
+  return { ok: true, ...summary, message: `Redis availability rebuilt: ${summary.roomNights} room-nights set, ${summary.staleKeysDropped} stale keys dropped${summary.oversoldRoomNights?`, ${summary.oversoldRoomNights} oversold`:''}` };
+});
+
+// Idempotent schema upgrades for databases created before date-range bookings existed.
+async function migrate() {
+  await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS check_in DATE`);
+  await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS check_out DATE`);
+  await pool.query(`UPDATE bookings SET check_in=created_at::date, check_out=created_at::date+1 WHERE check_in IS NULL`);
+  await pool.query(`ALTER TABLE bookings ALTER COLUMN check_in SET NOT NULL, ALTER COLUMN check_out SET NOT NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS bookings_room_dates_idx ON bookings(room_id, check_in, check_out)`);
+  await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check`);
+  await pool.query(`ALTER TABLE bookings ADD CONSTRAINT bookings_status_check CHECK (status IN ('PENDING','CONFIRMED','CANCELLED','EXPIRED','PAYMENT_TIMEOUT'))`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS bookings_pending_expiry_idx ON bookings(expires_at) WHERE status='PENDING'`);
+  await pool.query(`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS simulation_runs (
+    id UUID PRIMARY KEY, status TEXT NOT NULL, params JSONB NOT NULL DEFAULT '{}'::jsonb, report JSONB NOT NULL DEFAULT '{}'::jsonb,
+    customer_ids UUID[] NOT NULL DEFAULT '{}', created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ)`);
+  // Any run left RUNNING by a restart can never finish.
+  await pool.query(`UPDATE simulation_runs SET status='FAILED', report = report || '{"error":"API restarted while running"}' WHERE status='RUNNING'`);
+}
+
+async function start() {
+  await migrate();
+  await rebuildAvailability();
+  await producer.connect();
+  await app.listen({port:Number(process.env.PORT||3000),host:'0.0.0.0'});
+  outboxLoop();
+  expiryLoop();
+}
+start();
