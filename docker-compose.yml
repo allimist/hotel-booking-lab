@@ -21,6 +21,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    # Hard memory cap: at the limit Redis rejects writes (OOM error) instead of growing until the VM kills it.
+    # The admin "Redis capacity test" fills Redis up to this limit. Raise it only if the podman VM has the RAM.
+    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-400mb}", "--maxmemory-policy", "noeviction"]
     ports:
       - "6379:6379"
     healthcheck:
@@ -80,15 +83,30 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "3010:3010"
     environment:
-      PORT: 3000
+      PORT: 3010
       DATABASE_URL: postgresql://booking:booking@postgres:5432/booking
       REDIS_URL: redis://redis:6379
       KAFKA_BROKERS: kafka:9092
       JWT_SECRET: local-learning-secret
       CORS_ORIGIN: http://localhost:5173
       KAFKAJS_NO_PARTITIONER_WARNING: "1"
+      AVAILABILITY_DAYS: 365
+
+  # Rolls the Redis availability window daily: adds the new night 365 days out, removes yesterday.
+  availability-worker:
+    build: ./apps/availability-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://booking:booking@postgres:5432/booking
+      REDIS_URL: redis://redis:6379
+      AVAILABILITY_DAYS: 365
 
   web:
     build: ./apps/web
@@ -97,7 +115,7 @@ services:
     ports:
       - "5173:5173"
     environment:
-      VITE_API_URL: http://localhost:3000/api
+      VITE_API_URL: http://localhost:3010/api
       VITE_KAFKA_UI_URL: http://localhost:8080
       VITE_KAFKA_BROKER: kafka:9092
       VITE_POSTGRES: "localhost:5433 (user/db/password: booking)"
