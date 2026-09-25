@@ -1,6 +1,6 @@
 # Hotel Booking Lab
 
-A hands-on learning project that rebuilds the core of a hotel booking platform (think Agoda / Booking.com) small enough to read in an afternoon, but with the real hard parts left in: atomic inventory under concurrency, a payment lock with timeouts, the transactional Outbox pattern into Kafka, role-based access with admin impersonation, and a built-in load simulator that shows you where the bottlenecks are.
+A hands-on learning project that rebuilds the core of a hotel booking platform (think Agoda / Booking.com) small enough to read in an afternoon, but with the real hard parts left in: atomic inventory under concurrency, a payment lock with timeouts, the transactional Outbox pattern into Kafka, role-based access with admin impersonation, a built-in load simulator that shows you where the bottlenecks are, and a Redis capacity test that fills Redis until it is full.
 
 Everything runs locally with Docker Compose or Podman Compose. Nothing is production-ready on purpose: passwords are plain text and shown on the login page so anyone can try every role.
 
@@ -13,7 +13,8 @@ Everything runs locally with Docker Compose or Podman Compose. Nothing is produc
 | API | Node.js 22, TypeScript, Fastify 5 | small, fast, typed REST API |
 | Web | React 19, Vite 8, TypeScript | single-file SPA, inline SVG charts |
 | Source of truth | PostgreSQL 16 | users, hotels, rooms, bookings, audit log, outbox, simulation runs |
-| Inventory / locks | Redis 7 + Lua | one counter per room per night, atomic all-or-nothing reservation |
+| Inventory / locks | Redis 7 + Lua | one counter per room per night for the next 365 nights, atomic all-or-nothing reservation; capped with `maxmemory` |
+| Availability worker | Node.js 22, TypeScript | rolls the 365-night Redis window once a day (adds the new night, removes yesterday) |
 | Events | Apache Kafka 3.9 (KRaft) + Kafka UI | domain events published from the outbox |
 | Auth | JWT | roles CUSTOMER / SELLER / ADMIN, admin impersonation with audit trail |
 | Containers | Docker Compose / Podman Compose | healthchecks, dependency ordering |
@@ -21,10 +22,12 @@ Everything runs locally with Docker Compose or Podman Compose. Nothing is produc
 ## Run it
 
 ```bash
-docker compose up --build
-# or
 podman compose up --build
+# or
+docker compose up --build
 ```
+
+Redis is capped at 400 MB (`maxmemory`, writes are refused when full instead of the VM running out of memory). Change it with `REDIS_MAXMEMORY=1500mb podman compose up -d --force-recreate redis`, after giving the Podman VM enough RAM.
 
 Then open:
 
@@ -38,16 +41,19 @@ Then open:
 
 The login page lists every account with its password; click a row to log in. On a fresh database only the admin exists (`admin@example.com` / `admin123`). Log in as admin and press **Generate Sample Data** to create 20 hotels, two sellers and two customers. Re-running it is safe.
 
+The login page also shows the catalogue at a glance (hotels, rooms, room-nights bookable right now) and the accounts in three tables: admins, sellers and customers.
+
 After changing code, rebuild and recreate the containers (podman-compose does not recreate on image change by itself):
 
 ```bash
-podman compose up --build -d --force-recreate --no-deps api web
+podman compose up --build -d --force-recreate --no-deps api availability-worker web
 ```
 
 ## What you can do
 
 **As a customer**
-- Search hotels by city, pick check-in / check-out dates, open a hotel to see per-night availability and the total price for the stay.
+- Search hotels by country and city, pick check-in / check-out dates, open a hotel to see per-night availability and the total price for the stay.
+- Results show a **Sold out** badge when no room is free for every night of the selected dates, are paged (10 / 20 / 50 / 100 per page, pager above and below the results) and can be viewed as cards or as a compact list with a small picture.
 - Book a room: the nights are locked for you immediately and the booking is *Awaiting payment*. Pay within 60 seconds in **My bookings** or the status becomes *Payment timed out* and the room is released.
 - My bookings shows a live countdown, a Pay button, a Cancel button for upcoming stays, a stay-phase badge (Upcoming / Staying now / Completed) and a warning when two of your stays overlap.
 
@@ -57,10 +63,12 @@ podman compose up --build -d --force-recreate --no-deps api web
 
 **As an admin**
 - Generate / delete sample data, create sample bookings for a chosen customer, rebuild the Redis availability cache from PostgreSQL.
+- **Redis records**: every room × night of the window with the value Redis holds, window check (every room has every night), Redis RAM used vs its limit. **Availability log**: every run of the availability worker.
 - **Concurrency demo**: every customer books the same room at the same instant; see exactly who wins.
 - **Load simulation** with a report that ranks the slowest steps (p95) and a Cancel-all button:
-  - *Random rooms this week*: N customers book random rooms at once; a share pays, a share lets the lock expire and rebooks, the rest abandon.
-  - *Same room, 7 nights*: everyone wants one room; rejected customers cascade to another room type in the hotel, then to another hotel.
+  - *Random rooms this week*: N customers book random rooms at once, optionally only in one country or city; a share pays, a share lets the lock expire and rebooks, the rest abandon.
+  - *Same room, 7 nights*: everyone wants one room; rejected customers cascade to another room type in the hotel, then to another hotel (anywhere, same country or same city).
+- **Redis capacity test**: generate 1,000 to 1,000,000 sellers with 1, 10 or 100 hotels each (3 room types, 365 nights, spread over 20 cities in 6 countries). Hotels are loaded in batches of 250 until done, stopped, or Redis reaches `maxmemory`; the half-loaded batch is then rolled back. Tiles show Redis RAM, keys, bytes per key and progress. **Remove capacity-test data** deletes it all again.
 
 ![Admin load simulation report](docs/admin-simulation.png)
 
@@ -71,7 +79,7 @@ podman compose up --build -d --force-recreate --no-deps api web
 3. `POST /api/bookings/:id/pay` is a single conditional `UPDATE ... WHERE status='PENDING' AND expires_at > now()`, so a late payment and the expiry worker can never both win.
 4. A worker moves expired `PENDING` rows to `PAYMENT_TIMEOUT` (`FOR UPDATE SKIP LOCKED`), gives the nights back to Redis and writes `booking.payment_timeout`.
 5. The outbox publisher sends unpublished events to Kafka and stamps `published_at`. Watch the topics in Kafka UI: `booking.created`, `booking.confirmed`, `booking.payment_timeout`, `booking.cancelled`, `room.availability.changed`.
-6. Redis is treated as a cache: at startup (and from the admin panel) the per-night counters are rebuilt from the bookings table.
+6. Redis is treated as a cache: at startup (and from the admin panel) the per-night counters are rebuilt from the bookings table, 200 rooms at a time. The availability worker keeps exactly 365 nights per room loaded, rolling the window after UTC midnight.
 
 More detail in [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -89,13 +97,29 @@ More detail in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The publisher (1.5 s poll, one Kafka send per event) is the bottleneck by two orders of magnitude; Redis is negligible. Obvious next steps: batch the Kafka sends, replace polling with `LISTEN/NOTIFY`, shorten the worker interval.
 
+## What the Redis capacity test showed
+
+Podman VM with 2 GB RAM, Redis capped at 400 MB:
+
+| Measure | Result |
+|---|---|
+| Memory per availability key | ~110 bytes (key name ~60 chars + Redis bookkeeping) |
+| Memory per hotel (3 room types × 365 nights) | ~120 KB |
+| Load speed | ~600,000 keys / s (1,000 hotels in 1.6 s) |
+| Full at | ~4.1 million keys ≈ 3,750 hotels |
+| Remove 3,750 hotels | ~7 s |
+
+When Redis is full it refuses writes, so new bookings fail too. One key per room per night means memory grows with the catalogue, not with bookings: 10,000 hotels need ~1.2 GB, 1,000,000 hotels ~120 GB. Storing only booked nights (capacity minus bookings, one small hash per room per month) would make memory grow with bookings instead; that is the planned next step.
+
 ## API overview
 
 | Method | Path | Role |
 |---|---|---|
 | GET | `/api/auth/demo-accounts` | public, lists every account (learning project) |
 | POST | `/api/auth/login` | public |
-| GET | `/api/hotels?city=&page=&limit=` | public, sellers see only their own |
+| GET | `/api/stats` | public, hotels / rooms / bookable room-nights |
+| GET | `/api/locations` | public, countries and cities with hotel counts |
+| GET | `/api/hotels?country=&city=&page=&limit=&checkIn=&checkOut=` | public, sellers see only their own; with dates adds `soldOut` |
 | GET | `/api/hotels/:id?checkIn=&checkOut=` | public, per-night availability |
 | POST | `/api/bookings` `{ roomId, checkIn, checkOut }` | customer, locks the room |
 | POST | `/api/bookings/:id/pay` | customer |
@@ -108,13 +132,17 @@ The publisher (1.5 s poll, one Kafka send per event) is the bottleneck by two or
 | POST / DELETE | `/api/admin/sample-data` | admin |
 | POST | `/api/admin/sample-bookings` `{ userId }` | admin |
 | POST | `/api/admin/concurrent-booking` `{ roomId, checkIn, checkOut, confirm? }` | admin |
-| POST | `/api/admin/simulation` `{ mode, customers, payRatio, lateRatio, windowSeconds, roomId? }` | admin, then `GET /api/admin/simulation/:id`, `POST .../cancel-all` |
+| POST | `/api/admin/simulation` `{ mode, customers, payRatio, lateRatio, windowSeconds, roomId?, country?, city?, fallbackScope? }` | admin, then `GET /api/admin/simulation/:id`, `POST .../cancel-all` |
 | POST | `/api/admin/rebuild-availability` | admin |
+| GET | `/api/admin/redis-records?hotelId=&night=&page=&limit=` | admin |
+| GET | `/api/admin/availability-log` | admin |
+| GET / POST / DELETE | `/api/admin/load-test` `{ sellers, hotelsPerSeller }`, `POST /api/admin/load-test/stop` | admin, Redis capacity test |
 
 ## Project layout
 
 ```
-apps/api/src/server.ts   Fastify API, workers, simulation (single file on purpose)
+apps/api/src/server.ts   Fastify API, workers, simulation, capacity test (single file on purpose)
+apps/availability-worker/src/worker.ts   daily roll of the Redis availability window
 apps/web/src/main.tsx    React SPA
 apps/web/src/style.css
 database/init.sql        schema for a fresh database (the API also migrates older ones)
