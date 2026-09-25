@@ -21,6 +21,9 @@ async function api(path:string, opts:any={}) {
 const isoDate=(d:Date)=>d.toISOString().slice(0,10);
 const plusDays=(iso:string,n:number)=>{const t=new Date(iso+'T00:00:00Z');t.setUTCDate(t.getUTCDate()+n);return isoDate(t)};
 const today=isoDate(new Date());
+/** Calendar-month shift that stays in the target month: 31 Jan + 1 month = 28/29 Feb, not 3 Mar. */
+const plusMonths=(iso:string,n:number)=>{const [y,m,d]=iso.split('-').map(Number);const last=new Date(Date.UTC(y,m-1+n+1,0)).getUTCDate();return isoDate(new Date(Date.UTC(y,m-1+n,Math.min(d,last))))};
+const SHIFTS:[string,number,'day'|'month'][]=[['−1 month',-1,'month'],['−1 week',-7,'day'],['−1 day',-1,'day'],['+1 day',1,'day'],['+1 week',7,'day'],['+1 month',1,'month']];
 const fmt=(iso:string)=>new Date(iso+'T00:00:00Z').toLocaleDateString(undefined,{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'});
 const baht=(n:any)=>'฿'+Math.round(Number(n)).toLocaleString();
 const STATUS_LABEL:Record<string,string>={PENDING:'Awaiting payment',CONFIRMED:'Confirmed',CANCELLED:'Cancelled',PAYMENT_TIMEOUT:'Payment timed out',EXPIRED:'Expired'};
@@ -260,6 +263,97 @@ function RedisRecords({hotels,onMessage}:{hotels:any[],onMessage:(m:string)=>voi
   </section>;
 }
 
+const WEEKDAYS=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const KIND_LABEL:Record<string,string>={SEASON:'Season',HOLIDAY:'Holiday',DISCOUNT:'Discount',WEEKDAY:'Day of week'};
+const signedPct=(n:number)=>`${n>0?'+':n<0?'−':''}${Math.abs(n)}%`;
+const ruleWhen=(r:any)=>r.start_date===r.end_date?fmt(r.start_date):`${fmt(r.start_date)} → ${fmt(r.end_date)}`;
+const ruleAdjust=(r:any)=>r.kind==='DISCOUNT'?`−${r.adjust_value}%`:r.adjust_type==='FIXED'?`${baht(r.adjust_value)} fixed`:signedPct(r.adjust_value);
+/** "Tue 1 Dec ฿1,200 (High season · Fri +20%)" lines, for hover titles. */
+const breakdownTitle=(nightly:any[]|null)=>nightly?.map(n=>`${fmt(n.night)}  ${baht(n.price)}${n.rule?`  (${n.rule.name})`:''}`).join('\n')||'';
+const PRICE_ORDER='Price of a night = base price → holiday price (replaces season and day of week) or season price → × day-of-week % → − the biggest discount. Room-type rules beat hotel rules, hotel rules beat country rules.';
+
+/** Seven % boxes, Sunday..Saturday. With `inherited` (hotel mode) an empty box uses the country's value. */
+function WeekdayGrid({value,inherited,onSave}:{value:(number|null)[],inherited?:number[],onSave:(v:(number|null)[])=>void}){
+  const asText=(a:(number|null)[])=>a.map(x=>x==null?'':String(Number(x)));
+  const [v,setV]=useState<string[]>(asText(value));
+  useEffect(()=>setV(asText(value)),[asText(value).join()]);
+  const put=(i:number,x:string)=>{const n=[...v];n[i]=x;setV(n)};
+  return <div className="weekday-grid">{WEEKDAYS.map((d,i)=><label key={d}>{d}
+      <input type="number" value={v[i]} placeholder={inherited?String(inherited[i]):'0'} onChange={e=>put(i,e.target.value)}/>
+      {inherited&&<small>{v[i]===''?`country ${signedPct(inherited[i])}`:<a href="#" onClick={e=>{e.preventDefault();put(i,'')}}>use country</a>}</small>}</label>)}
+    <button disabled={v.join()===asText(value).join()} onClick={()=>onSave(v.map(x=>x===''?null:Number(x)))}>Save</button></div>;
+}
+
+/** Add a season / holiday / discount. Discounts are always "% off". */
+function RuleForm({kinds,rooms,onAdd}:{kinds:string[],rooms?:any[],onAdd:(b:any)=>Promise<boolean>}){
+  const [f,setF]=useState<any>({kind:kinds[0],name:'',roomId:'',startDate:'',endDate:'',adjustType:'PERCENT',adjustValue:20});
+  const set=(k:string,v:any)=>setF({...f,[k]:v}); const disc=f.kind==='DISCOUNT';
+  return <div className="rule-form">
+    <label>Kind<select value={f.kind} onChange={e=>setF({...f,kind:e.target.value,adjustType:'PERCENT',adjustValue:e.target.value==='DISCOUNT'?10:20})}>{kinds.map(k=><option key={k} value={k}>{KIND_LABEL[k]}</option>)}</select></label>
+    <label>Name<input value={f.name} onChange={e=>set('name',e.target.value)} placeholder={f.kind==='HOLIDAY'?'e.g. Songkran':f.kind==='SEASON'?'e.g. High season':'e.g. Early bird'}/></label>
+    {rooms&&<label>Room type<select value={f.roomId} onChange={e=>set('roomId',e.target.value)}><option value="">All room types</option>{rooms.map((r:any)=><option key={r.id} value={r.id}>{r.name}</option>)}</select></label>}
+    <label>From<input type="date" value={f.startDate} onChange={e=>setF({...f,startDate:e.target.value,endDate:f.endDate&&f.endDate>=e.target.value?f.endDate:e.target.value})}/></label>
+    <label>To<input type="date" min={f.startDate} value={f.endDate} onChange={e=>set('endDate',e.target.value)}/></label>
+    {!disc&&<label>Price<select value={f.adjustType} onChange={e=>set('adjustType',e.target.value)}><option value="PERCENT">% of base price</option><option value="FIXED">Fixed price ฿</option></select></label>}
+    <label>{disc?'Discount %':f.adjustType==='PERCENT'?'Change %':'Price ฿'}<input type="number" value={f.adjustValue} onChange={e=>set('adjustValue',e.target.value)}/></label>
+    <button onClick={async()=>{if(await onAdd({...f,adjustValue:Number(f.adjustValue)}))setF({...f,name:''})}}>Add {KIND_LABEL[f.kind].toLowerCase()}</button>
+  </div>;
+}
+
+/** Seller: base prices, day-of-week % (overriding the country), seasons / holidays / discounts, and a 60-night price calendar. */
+function PricesModal({hotel,onClose,onMessage}:{hotel:any,onClose:()=>void,onMessage:(m:string)=>void}){
+  const [d,setD]=useState<any>(null); const [base,setBase]=useState<Record<string,string>>({});
+  async function load(){try{const x=await api(`/seller/hotels/${hotel.id}/prices?days=60`);setD(x);setBase(Object.fromEntries(x.rooms.map((r:any)=>[r.id,String(Math.round(Number(r.price)))])))}catch(e:any){onMessage(e.message)}}
+  useEffect(()=>{load()},[hotel.id]);
+  async function call(path:string,method:string,body:any,done:string){try{await api(path,{method,...(body!==undefined?{body:JSON.stringify(body)}:{})});onMessage(done);load();return true}catch(e:any){onMessage(e.message);return false}}
+  return <div className="modal" onClick={onClose}><div className="card wide" onClick={e=>e.stopPropagation()}><button onClick={onClose}>Close</button>
+    <h2>Prices · {hotel.name} <small>({place(hotel)})</small></h2>
+    {!d?<p>Loading…</p>:<>
+    <small>{PRICE_ORDER}</small>
+    <h3>Base price per night</h3>
+    <div className="tablewrap"><table><tbody>{d.rooms.map((r:any)=><tr key={r.id}><td>{r.name}</td><td>{r.total_rooms} rooms</td>
+      <td><input type="number" min={1} value={base[r.id]??''} onChange={e=>setBase({...base,[r.id]:e.target.value})}/></td>
+      <td><button onClick={()=>call(`/seller/rooms/${r.id}`,'PATCH',{price:Number(base[r.id])},`Base price of ${r.name} saved`)} disabled={Number(base[r.id])===Math.round(Number(r.price))}>Save</button></td></tr>)}</tbody></table></div>
+    <h3>Day of the week</h3>
+    <small>Leave a day empty to use the {d.hotel.country} default (set by the admin); fill it in to use your own % for that day. Negative = cheaper.</small>
+    <WeekdayGrid value={d.hotelPct} inherited={d.countryPct} onSave={pct=>call(`/seller/hotels/${hotel.id}/weekdays`,'PUT',{pct},'Day-of-week prices saved')}/>
+    <h3>Seasons, holidays and discounts</h3>
+    <div className="tablewrap"><table><thead><tr><th>Kind</th><th>Name</th><th>Applies to</th><th>When</th><th>Price</th><th></th></tr></thead><tbody>
+      {d.rules.map((r:any)=><tr key={r.id} className={r.source==='country'?'inherited':''}><td><span className={`ptag ${r.kind}`}>{KIND_LABEL[r.kind]}</span></td><td>{r.name}</td>
+        <td>{r.source==='country'?`All ${r.country} hotels (country default)`:r.roomName||'All room types'}</td><td>{ruleWhen(r)}</td><td>{ruleAdjust(r)}</td>
+        <td>{r.source!=='country'&&<button className="danger" onClick={()=>confirm(`Delete "${r.name}"?`)&&call(`/seller/price-rules/${r.id}`,'DELETE',undefined,'Rule deleted')}>Delete</button>}</td></tr>)}
+      {d.rules.length===0&&<tr><td colSpan={6}>No seasons, holidays or discounts.</td></tr>}
+    </tbody></table></div>
+    <RuleForm kinds={['SEASON','HOLIDAY','DISCOUNT']} rooms={d.rooms} onAdd={b=>call(`/seller/hotels/${hotel.id}/price-rules`,'POST',b,`${KIND_LABEL[b.kind]} added`)}/>
+    <h3>Next {d.days} nights</h3>
+    <div className="tablewrap"><table className="price-cal"><thead><tr><th>Room type</th>{d.calendar[0]?.nightly.map((n:any)=>{const dt=new Date(n.night+'T00:00:00Z');
+      return <th key={n.night}>{dt.getUTCDate()===1||n.night===d.from?<small>{dt.toLocaleDateString(undefined,{month:'short',timeZone:'UTC'})}<br/></small>:null}{WEEKDAYS[dt.getUTCDay()].slice(0,2)}<br/>{dt.getUTCDate()}</th>})}</tr></thead><tbody>
+      {d.calendar.map((c:any)=>{const room=d.rooms.find((r:any)=>r.id===c.roomId);return <tr key={c.roomId}><td>{room?.name}</td>
+        {c.nightly.map((n:any)=><td key={n.night} className={n.rule?`p-${n.rule.kind}${n.price<Number(room?.price)?' cheaper':''}`:''} title={`${fmt(n.night)}: ${baht(n.price)}${n.label?` (${n.label})`:' (base price)'}`}>{Math.round(n.price).toLocaleString()}</td>)}</tr>})}
+    </tbody></table></div>
+    <small className="legend"><span className="p-WEEKDAY">day of week</span> <span className="p-SEASON">season</span> <span className="p-HOLIDAY">holiday</span> <span className="p-DISCOUNT">discount</span> · <b>bold</b> = below base price · hover a price for its layers · ฿ per night</small>
+    </>}
+  </div></div>;
+}
+
+/** Admin: each country's day-of-week % and national seasons / holidays. Hotels inherit them unless they override. */
+function CountryPricing({onMessage}:{onMessage:(m:string)=>void}){
+  const [rows,setRows]=useState<any[]|null>(null);
+  async function load(){try{setRows(await api('/admin/country-pricing'))}catch(e:any){onMessage(e.message)}}
+  useEffect(()=>{load()},[]);
+  async function call(path:string,method:string,body:any,done:string){try{await api(path,{method,...(body!==undefined?{body:JSON.stringify(body)}:{})});onMessage(done);load();return true}catch(e:any){onMessage(e.message);return false}}
+  return <section className="card"><h2>Country pricing</h2>
+    <small>{PRICE_ORDER} Hotels can override single days and add their own seasons, holidays and discounts in My hotels → Prices.</small>
+    {!rows?<p>Loading…</p>:rows.map(c=><div key={c.country} className="country-card">
+      <h3>{c.country} <small>{c.hotels.toLocaleString()} hotels{c.hotelsWithOwnWeekdays?` · ${c.hotelsWithOwnWeekdays} with their own day-of-week prices`:''}</small></h3>
+      <WeekdayGrid value={c.weekdayPct} onSave={pct=>call(`/admin/country-pricing/${encodeURIComponent(c.country)}/weekdays`,'PUT',{pct:pct.map(x=>x??0)},`${c.country}: day-of-week prices saved`)}/>
+      {c.rules.length>0&&<div className="tablewrap"><table><tbody>{c.rules.map((r:any)=><tr key={r.id}><td><span className={`ptag ${r.kind}`}>{KIND_LABEL[r.kind]}</span></td><td>{r.name}</td><td>{ruleWhen(r)}</td><td>{ruleAdjust(r)}</td>
+        <td><button className="danger" onClick={()=>confirm(`Delete "${r.name}" for ${c.country}?`)&&call(`/admin/price-rules/${r.id}`,'DELETE',undefined,'Rule deleted')}>Delete</button></td></tr>)}</tbody></table></div>}
+      <RuleForm kinds={['SEASON','HOLIDAY']} onAdd={b=>call(`/admin/country-pricing/${encodeURIComponent(c.country)}/rules`,'POST',b,`${c.country}: ${KIND_LABEL[b.kind].toLowerCase()} added`)}/>
+    </div>)}
+  </section>;
+}
+
 const LOAD_SELLERS=[1000,10000,100000,1000000], LOAD_HOTELS=[1,10,100];
 const LOAD_STATUS:Record<string,string>={RUNNING:'Running…',DONE:'✓ Done',REDIS_FULL:'✕ Redis full',STOPPED:'Stopped',FAILED:'✕ Failed'};
 /** Admin: fills Redis with generated sellers/hotels until done or Redis reaches its maxmemory, then removes them. */
@@ -331,16 +425,16 @@ function AvailabilityLog({onMessage}:{onMessage:(m:string)=>void}){
 function App(){
   const [user,setUser]=useState<any>(JSON.parse(localStorage.getItem('user')||'null'));
   const [hotels,setHotels]=useState<any[]>([]); const [hotelTotal,setHotelTotal]=useState(0); const [hotelPage,setHotelPage]=useState(1);
-  const [pageSize,setPageSize]=useState(20);
+  const [pageSize,setPageSize]=useState(20); const [sort,setSort]=useState(''); const [priceSortApprox,setPriceSortApprox]=useState(false);
   const [layout,setLayoutState]=useState<'cards'|'list'>(()=>{try{return localStorage.getItem('hotelLayout')==='list'?'list':'cards'}catch{return 'cards'}});
   function setLayout(v:'cards'|'list'){setLayoutState(v);try{localStorage.setItem('hotelLayout',v)}catch{}} const [selected,setSelected]=useState<any>(null);
   const [email,setEmail]=useState('customer@example.com'); const [password,setPassword]=useState('customer123');
   const [city,setCity]=useState(''); const [country,setCountry]=useState(''); const [locations,setLocations]=useState<any[]>([]);
   const [stats,setStats]=useState<any>(null);
   const [checkIn,setCheckIn]=useState(today); const [checkOut,setCheckOut]=useState(plusDays(today,1));
-  const [view,setView]=useState<'search'|'bookings'|'myhotels'|'dashboard'|'redis'|'redislog'>(user?.role==='SELLER'?'dashboard':'search');
+  const [view,setView]=useState<'search'|'bookings'|'myhotels'|'dashboard'|'redis'|'redislog'|'pricing'>(user?.role==='SELLER'?'dashboard':'search');
   const [dashDays,setDashDays]=useState(7);
-  const [myHotels,setMyHotels]=useState<any[]>([]); const [hotelBookings,setHotelBookings]=useState<any>(null);
+  const [myHotels,setMyHotels]=useState<any[]>([]); const [hotelBookings,setHotelBookings]=useState<any>(null); const [pricesHotel,setPricesHotel]=useState<any>(null);
   const [bookings,setBookings]=useState<any[]>([]);
   const [customers,setCustomers]=useState<any[]>([]); const [customerId,setCustomerId]=useState('');
   const [adminHotels,setAdminHotels]=useState<any[]>([]); const [adminHotelId,setAdminHotelId]=useState(''); const [adminRooms,setAdminRooms]=useState<any[]>([]); const [adminRoomId,setAdminRoomId]=useState('');
@@ -360,7 +454,7 @@ function App(){
   async function login(e=email,p=password){try{const x=await api('/auth/login',{method:'POST',body:JSON.stringify({email:e,password:p})});localStorage.setItem('token',x.token);localStorage.setItem('user',JSON.stringify(x.user));setUser(x.user);setView(x.user.role==='SELLER'?'dashboard':'search');setMessage('Logged in')}catch(err:any){setMessage(err.message+(e.includes('example.com')&&e!=='admin@example.com'?' (login as Admin and Generate Sample Data first)':''))}}
   function quickLogin(a:{email:string,password:string}){setEmail(a.email);setPassword(a.password);login(a.email,a.password)}
   async function loadLocations(){try{setLocations(await api('/locations'))}catch(e:any){setMessage(e.message)}}
-  async function search(p=hotelPage,size=pageSize){try{const x=await api(`/hotels?country=${encodeURIComponent(country)}&city=${encodeURIComponent(city)}&page=${p}&limit=${size}${rangeOk?'&'+range:''}`);setHotels(x.items);setHotelTotal(x.total);setHotelPage(p)}catch(e:any){setMessage(e.message)}}
+  async function search(p=hotelPage,size=pageSize){try{const x=await api(`/hotels?country=${encodeURIComponent(country)}&city=${encodeURIComponent(city)}&page=${p}&limit=${size}&sort=${sort}${rangeOk?'&'+range:''}`);setHotels(x.items);setPriceSortApprox(!!x.priceSortApprox);setHotelTotal(x.total);setHotelPage(p)}catch(e:any){setMessage(e.message)}}
   async function openHotel(id:string){if(!rangeOk){setMessage('Choose a valid date range first');return}try{setSelected(await api(`/hotels/${id}?${range}`))}catch(e:any){setMessage(e.message)}}
   async function book(roomId:string){try{const x=await api('/bookings',{method:'POST',body:JSON.stringify({roomId,checkIn,checkOut})});setMessage(`Room locked for you for ${x.paymentWindowSeconds}s: ${x.nights} night(s), ${baht(x.totalPrice)}. Press Pay in My bookings to confirm.`);setSelected(null);setView('bookings');loadBookings()}catch(e:any){setMessage(e.message)}}
   async function pay(id:string){try{await api(`/bookings/${id}/pay`,{method:'POST'});setMessage('Payment received. Booking confirmed.');loadBookings()}catch(e:any){setMessage(e.message);loadBookings()}}
@@ -378,7 +472,7 @@ function App(){
   function onCheckIn(v:string){setCheckIn(v);if(checkOut<=v)setCheckOut(plusDays(v,1))}
   // Reload the hotel list whenever the logged-in user changes: the API scopes it (sellers see only their hotels).
   useEffect(()=>{search(1);setSelected(null);if(user)loadLocations()},[user?.id]);
-  useEffect(()=>{if(user)search(1)},[country,city]);
+  useEffect(()=>{if(user)search(1)},[country,city,sort]);
   useEffect(()=>{if(user&&rangeOk)search()},[checkIn,checkOut]);
   useEffect(()=>{if(view==='bookings'&&user)loadBookings();if(view==='myhotels'&&user)loadMyHotels()},[view]);
   const pending=bookings.filter(b=>b.status==='PENDING');
@@ -394,6 +488,7 @@ function App(){
   const hotelPager=(bottom=false)=>{const pages=Math.max(1,Math.ceil(hotelTotal/pageSize));return <div className="row between pager" id={bottom?undefined:'hotel-results'}>
         <small>{hotelTotal.toLocaleString()} hotel{hotelTotal===1?'':'s'}</small>
         <span className="row">
+          <label className="inline">Sort<select value={sort} onChange={e=>setSort(e.target.value)}><option value="">Newest</option><option value="price_asc">Price: low to high</option><option value="price_desc">Price: high to low</option></select></label>
           <label className="inline">Show<select value={pageSize} onChange={e=>{const n=Number(e.target.value);setPageSize(n);search(1,n);if(bottom)scrollToResults()}}>{[10,20,50,100].map(n=><option key={n} value={n}>{n}</option>)}</select>per page</label>
           <button disabled={hotelPage<=1} onClick={()=>{search(hotelPage-1);if(bottom)scrollToResults()}}>Previous</button><span className="pageno">Page {hotelPage} of {pages.toLocaleString()}</span><button disabled={hotelPage>=pages} onClick={()=>{search(hotelPage+1);if(bottom)scrollToResults()}}>Next</button>
           <span className="toggle"><button className={layout==='cards'?'active':''} onClick={()=>setLayout('cards')}>Cards</button><button className={layout==='list'?'active':''} onClick={()=>setLayout('list')}>List</button></span>
@@ -439,6 +534,7 @@ function App(){
         {user.role==='SELLER'&&<button className={view==='myhotels'?'active':''} onClick={()=>setView('myhotels')}>My hotels</button>}
         {user.role==='ADMIN'&&<button className={view==='redis'?'active':''} onClick={()=>setView('redis')}>Redis records</button>}
         {user.role==='ADMIN'&&<button className={view==='redislog'?'active':''} onClick={()=>setView('redislog')}>Availability log</button>}
+        {user.role==='ADMIN'&&<button className={view==='pricing'?'active':''} onClick={()=>setView('pricing')}>Country pricing</button>}
         <button onClick={()=>{localStorage.clear();location.reload()}}>Logout</button>
       </nav>
       <h1>Hotel Booking Lab</h1><span>{user.name} · {user.role}</span>
@@ -446,6 +542,7 @@ function App(){
     <p className={`message${/days ahead/.test(message)?' error':''}`}>{message}</p>
     {view==='redis'&&user.role==='ADMIN'&&<RedisRecords hotels={adminHotels} onMessage={setMessage}/>}
     {view==='redislog'&&user.role==='ADMIN'&&<AvailabilityLog onMessage={setMessage}/>}
+    {view==='pricing'&&user.role==='ADMIN'&&<CountryPricing onMessage={setMessage}/>}
     {user.role==='ADMIN'&&view==='search'&&<section className="card admin"><h2>Admin</h2>
       <div className="row"><button onClick={sample}>Generate Sample Data</button><button onClick={delSample}>Delete Sample Data</button>
         <button onClick={async()=>{try{setMessage((await api('/admin/rebuild-availability',{method:'POST'})).message)}catch(e:any){setMessage(e.message)}}} title="Recompute Redis per-night counters from PostgreSQL bookings (also runs at API startup)">Rebuild Redis availability</button></div>
@@ -490,11 +587,12 @@ function App(){
       <div className="tablewrap"><table><thead><tr><th>Hotel</th><th>City</th><th>Address</th><th>Rooms</th><th>From / night</th><th>Upcoming bookings</th><th></th></tr></thead><tbody>
         {myHotels.map(h=><tr key={h.id}>
           <td><b>{h.name}</b></td><td>{place(h)}</td><td>{h.address}</td><td>{h.roomCount}</td><td>{baht(h.startingPrice)}</td><td>{h.upcomingBookings}</td>
-          <td className="actions"><button onClick={()=>openHotel(h.id)}>Availability</button><button onClick={()=>openHotelBookings(h)}>Bookings</button></td>
+          <td className="actions"><button onClick={()=>openHotel(h.id)}>Availability</button><button onClick={()=>openHotelBookings(h)}>Bookings</button><button onClick={()=>setPricesHotel(h)}>Prices</button></td>
         </tr>)}
       </tbody></table></div>}
     </section>}
 
+    {pricesHotel&&<PricesModal hotel={pricesHotel} onClose={()=>setPricesHotel(null)} onMessage={setMessage}/>}
     {hotelBookings&&<div className="modal" onClick={()=>setHotelBookings(null)}><div className="card wide" onClick={e=>e.stopPropagation()}><button onClick={()=>setHotelBookings(null)}>Close</button>
       <h2>Bookings · {hotelBookings.hotel.name}</h2>
       {hotelBookings.rows.length===0?<p>No bookings for this hotel.</p>:
@@ -509,12 +607,16 @@ function App(){
         <label>Check-in<input type="date" min={today} value={checkIn} onChange={e=>onCheckIn(e.target.value)}/></label>
         <label>Check-out<input type="date" min={plusDays(checkIn,1)} value={checkOut} onChange={e=>setCheckOut(e.target.value)}/></label>
         <span className="nights">{rangeOk?`${nights} night${nights===1?'':'s'}`:'Invalid dates'}</span>
+        {/* Move the whole stay, keeping its length; never into the past. */}
+        <span className="toggle shift">{SHIFTS.map(([label,n,unit])=>{const ci=unit==='month'?plusMonths(checkIn,n):plusDays(checkIn,n);
+          return <button key={label} disabled={ci<today||!rangeOk} title={`Move the stay to ${fmt(ci)} → ${fmt(plusDays(ci,nights))}`} onClick={()=>{setCheckIn(ci);setCheckOut(plusDays(ci,nights))}}>{label}</button>})}</span>
         <button onClick={()=>search(1)}>Search</button>
       </section>
       {hotelPager()}
-      {layout==='cards'?<section className="grid">{hotels.map(h=><article className="card" key={h.id} onClick={()=>openHotel(h.id)}><img loading="lazy" src={h.thumbnail}/><h3>{h.name}{h.soldOut&&<span className="soldout">Sold out</span>}</h3><p>{place(h)} · {h.address}</p><b>From {baht(h.startingPrice)} / night</b></article>)}</section>
+      {priceSortApprox&&<p><small>Sorted by base price: there are too many hotels to price every stay for these dates. Pick a country or city for an exact order.</small></p>}
+      {layout==='cards'?<section className="grid">{hotels.map(h=><article className="card" key={h.id} onClick={()=>openHotel(h.id)}><img loading="lazy" src={h.thumbnail}/><h3>{h.name}{h.soldOut&&<span className="soldout">Sold out</span>}</h3><p>{place(h)} · {h.address}</p><b>From {baht(h.startingPrice)} / night{h.priceForDates&&nights>1?' avg':''}</b>{h.startingTotal!=null&&nights>1&&<div className="stay-total">{baht(h.startingTotal)} total for {nights} nights</div>}</article>)}</section>
       :<section className="card"><div className="tablewrap"><table className="hotel-list"><tbody>
-        {hotels.map(h=><tr key={h.id} onClick={()=>openHotel(h.id)}><td className="thumb"><img loading="lazy" src={h.thumbnail}/></td><td><b>{h.name}</b>{h.soldOut&&<span className="soldout">Sold out</span>}<br/><small>{place(h)} · {h.address}</small></td><td className="price">From {baht(h.startingPrice)} / night</td></tr>)}
+        {hotels.map(h=><tr key={h.id} onClick={()=>openHotel(h.id)}><td className="thumb"><img loading="lazy" src={h.thumbnail}/></td><td><b>{h.name}</b>{h.soldOut&&<span className="soldout">Sold out</span>}<br/><small>{place(h)} · {h.address}</small></td><td className="price">From {baht(h.startingPrice)} / night{h.priceForDates&&nights>1?' avg':''}{h.startingTotal!=null&&nights>1&&<><br/><small>{baht(h.startingTotal)} total for {nights} nights</small></>}</td></tr>)}
       </tbody></table></div></section>}
       {hotels.length===0?<p>No hotels found.</p>:hotelPager(true)}
     </>}
@@ -525,7 +627,7 @@ function App(){
       {bookings.length===0?<p>No bookings yet.</p>:
       <div className="tablewrap"><table className="bookings"><thead><tr><th>Hotel</th><th>City</th><th>Room</th><th>Check-in</th><th>Check-out</th><th>Nights</th><th>Total</th><th>Status</th><th>Note</th><th>Stay</th></tr></thead><tbody>
         {bookings.map(b=><tr key={b.id} className={b.status==='PENDING'?'pending':b.overlaps?.length?'warn':''}>
-          <td><b>{b.hotelName}</b></td><td>{b.city}</td><td>{b.roomName}</td><td>{fmt(b.checkIn)}</td><td>{fmt(b.checkOut)}</td><td>{b.nights}</td><td>{baht(b.price)}</td>
+          <td><b>{b.hotelName}</b></td><td>{b.city}</td><td>{b.roomName}</td><td>{fmt(b.checkIn)}</td><td>{fmt(b.checkOut)}</td><td>{b.nights}</td><td title={breakdownTitle(b.priceBreakdown)}>{baht(b.price)}<br/><small>{baht(b.nightlyPrice)} / night{b.nights>1?' avg':''}</small></td>
           <td><span className={`status ${b.status}`}>{STATUS_LABEL[b.status]||b.status}</span>{b.status==='PENDING'&&<><br/><span className="countdown">{secondsLeft(b)}s left</span></>}</td>
           <td>{b.overlaps?.length>0&&<span className="notice" title={b.overlaps.map((o:any)=>`${o.hotelName} (${o.city}) ${fmt(o.checkIn)} → ${fmt(o.checkOut)}`).join('\n')}>⚠ Double booking: same dates as {b.overlaps.map((o:any)=>o.hotelName).join(', ')}</span>}</td>
           <td className="actions">
@@ -539,7 +641,8 @@ function App(){
 
     {selected&&<div className="modal" onClick={()=>setSelected(null)}><div className="card" onClick={e=>e.stopPropagation()}><button onClick={()=>setSelected(null)}>Close</button><h2>{selected.name}</h2><p>{place(selected)} · {selected.address}</p><p>{selected.description}</p>
       <h3>Rooms · {fmt(selected.checkIn)} → {fmt(selected.checkOut)} ({selected.nights} night{selected.nights===1?'':'s'})</h3>
-      {selected.rooms.map((r:any)=><div className="room" key={r.id}><span><b>{r.name}</b><br/>{baht(r.price)} / night · {baht(r.totalPrice)} total · {r.availableRooms} available</span><button disabled={r.availableRooms<1||user.role!=='CUSTOMER'} onClick={()=>book(r.id)}>Book</button></div>)}
+      {selected.rooms.map((r:any)=><div className="room" key={r.id}><span><b>{r.name}</b><br/>{baht(r.avgNightly)} / night{r.nights>1?' avg':''} · <b>{baht(r.totalPrice)} total</b> · {r.availableRooms} available
+        <details className="nightly"><summary>Price per night</summary>{r.nightly.map((n:any)=><div key={n.night}>{fmt(n.night)} <b>{baht(n.price)}</b>{n.rule&&<span className={`ptag ${n.rule.kind}`}>{n.rule.name}</span>}</div>)}</details></span><button disabled={r.availableRooms<1||user.role!=='CUSTOMER'} onClick={()=>book(r.id)}>Book</button></div>)}
     </div></div>}
   </main>
 }

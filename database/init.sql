@@ -34,6 +34,30 @@ CREATE TABLE IF NOT EXISTS rooms (
   is_sample BOOLEAN NOT NULL DEFAULT FALSE
 );
 
+-- Layered per-night pricing (see ARCHITECTURE.md): base price -> holiday or (season -> weekday %) -> discount.
+-- Weekday % per country, Sunday..Saturday; hotels.weekday_pct (added by the API migration) overrides single days.
+CREATE TABLE IF NOT EXISTS country_pricing (
+  country TEXT PRIMARY KEY,
+  weekday_pct NUMERIC(6,2)[] NOT NULL DEFAULT '{0,0,0,0,0,0,0}'
+);
+
+-- Seasons, holidays and discounts, for a whole country (admin) or one hotel / room type (seller).
+CREATE TABLE IF NOT EXISTS price_rules (
+  id UUID PRIMARY KEY,
+  hotel_id UUID REFERENCES hotels(id) ON DELETE CASCADE,
+  country TEXT,
+  room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('SEASON','HOLIDAY','DISCOUNT')),
+  name TEXT NOT NULL,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  adjust_type TEXT NOT NULL CHECK (adjust_type IN ('PERCENT','FIXED')),
+  adjust_value NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (end_date >= start_date),
+  CONSTRAINT price_rules_scope_check CHECK ((country IS NULL) <> (hotel_id IS NULL) AND (room_id IS NULL OR hotel_id IS NOT NULL))
+);
+
 CREATE TABLE IF NOT EXISTS bookings (
   id UUID PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES users(id),
@@ -45,6 +69,7 @@ CREATE TABLE IF NOT EXISTS bookings (
   check_out DATE NOT NULL,
   expires_at TIMESTAMPTZ,
   paid_at TIMESTAMPTZ,
+  price_breakdown JSONB,                                       -- [{night, price, rule}] at booking time
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CHECK (check_out > check_in)
 );
@@ -80,6 +105,7 @@ CREATE TABLE IF NOT EXISTS simulation_runs (
 
 CREATE INDEX IF NOT EXISTS hotels_city_idx ON hotels(city);
 CREATE INDEX IF NOT EXISTS rooms_hotel_idx ON rooms(hotel_id);
+CREATE INDEX IF NOT EXISTS price_rules_hotel_idx ON price_rules(hotel_id);
 CREATE INDEX IF NOT EXISTS bookings_user_idx ON bookings(user_id);
 CREATE INDEX IF NOT EXISTS bookings_room_dates_idx ON bookings(room_id, check_in, check_out);
 CREATE INDEX IF NOT EXISTS bookings_pending_expiry_idx ON bookings(expires_at) WHERE status='PENDING';

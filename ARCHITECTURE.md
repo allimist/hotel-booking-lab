@@ -20,8 +20,23 @@ Both steps are idempotent: a run that is late, repeated, or follows days of down
 
 Booking a date range runs one Lua script over every night of the stay (check-in inclusive, check-out exclusive): if any night is missing it returns -2, if any night is sold out it returns -1, and in both cases changes nothing; otherwise it decrements all nights atomically. Cancelling runs the inverse script on the nights that are not yet past, incrementing each night but never above `total_rooms`; it also refuses (-2) if any of those nights is missing. This is what prevents overselling under concurrent requests without a database lock.
 
+## Pricing
+A night's price is built in layers, all in PostgreSQL:
+
+1. **Base**: the room type's `rooms.price`.
+2. **Holiday** (`price_rules.kind='HOLIDAY'`): a fixed price or base +/- %. It replaces steps 3 and 4.
+3. **Season** (`'SEASON'`): a fixed price or base +/- %.
+4. **Day of week**: multiplied by that weekday's %. The hotel's own value for the day (`hotels.weekday_pct`, 7 values Sunday..Saturday, NULL = inherit) wins over the country default (`country_pricing.weekday_pct`, set by the admin), e.g. Israel Mon −15%, Thu +30%, Fri +40%, Sat +10%.
+5. **Discount** (`'DISCOUNT'`, hotel or room type only): minus the single largest active discount %. Discounts do not stack.
+
+Seasons and holidays exist at three levels: country (admin), hotel and room type (seller). Inside one layer the most specific rule wins (room type > hotel > country), then the newest. Example: an Israeli Friday in high season with a 10% hotel discount on a ฿1,000 room costs 1,000 × 1.40 × 1.40 × 0.90 = ฿1,764. Prices are whole baht.
+
+Prices are rules, not one row per room per night, so the pricing data stays tiny even for a large catalogue. Redis only answers "is a room free", so pricing never touches the atomic Lua scripts. `priceStay()` in the API is the only place prices are computed: the hotel page, search ("from" = the cheapest room's average per night for the selected dates), the seller's 60-night price calendar and booking all use it. Each night comes with its `parts` (layer, source, change) and a readable `label` such as "High season +40% · Fri +20% · Winter deal −10%".
+
+A booking is priced before its nights are reserved in Redis, so a pricing error never leaves a lock behind. The booking stores the total in `price` and every night's price and label in `price_breakdown`, so later price changes, by the seller or the admin, never alter an existing booking.
+
 ## Bookings and the payment lock
-`bookings` stores `check_in`, `check_out`, the total `price` for the stay, a `status`, `expires_at` and `paid_at`.
+`bookings` stores `check_in`, `check_out`, the total `price` for the stay, the per-night `price_breakdown`, a `status`, `expires_at` and `paid_at`.
 
 Booking is two-step. `POST /api/bookings` reserves the nights in Redis and inserts a `PENDING` row with `expires_at = now() + 60s` (`PAYMENT_WINDOW_SECONDS`). Other customers already see the room as taken. `POST /api/bookings/:id/pay` flips it to `CONFIRMED` only if the window has not passed; the check is a single conditional `UPDATE`, so a late payment and the expiry worker cannot both win.
 

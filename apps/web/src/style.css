@@ -25,3 +25,12 @@ input.secret{-webkit-text-security:disc}
 .account-tables{display:grid;grid-template-columns:1fr;gap:12px}.account-tables td{white-space:nowrap}.account-tables h4{margin:8px 0}.account-tables .accounts-scroll{max-height:260px}
 .tag{margin-left:6px;padding:1px 6px;border-radius:999px;background:#e8ecf3;color:#556;font-size:11px}
 .search label{min-width:0}.search select{min-width:180px}
+.ptag{display:inline-block;margin-left:6px;padding:1px 7px;border-radius:999px;font-size:11px;background:#e8ecf3}.ptag.WEEKEND,.p-WEEKEND,.ptag.WEEKDAY,.p-WEEKDAY{background:#e3f0ff;color:#0b4a8f}.ptag.DISCOUNT,.p-DISCOUNT{background:#d9f5e3;color:#116b32}.ptag.SEASON,.p-SEASON{background:#fff1d6;color:#8a5a00}.ptag.HOLIDAY,.p-HOLIDAY{background:#fde2e2;color:#8a1f1f}
+.nightly{margin-top:4px;font-size:13px}.nightly summary{cursor:pointer;color:#556}.nightly div{padding:2px 0}
+.price-cal th,.price-cal td{padding:4px 6px;text-align:center;font-size:12px;white-space:nowrap}.price-cal td:first-child,.price-cal th:first-child{text-align:left;position:sticky;left:0;background:#fff}
+.legend span{padding:1px 6px;border-radius:4px}.rule-form{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;align-items:flex-end}.rule-form label{display:flex;flex-direction:column;font-size:12px;gap:4px}.rule-form select{min-width:0}
+.weekdays{display:flex;gap:6px;border:1px solid #ccd3dc;border-radius:8px;padding:4px 8px;margin:0}.weekdays legend{font-size:12px}.weekdays label.check{flex-direction:row;align-items:center;font-size:13px}
+.weekday-grid{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin:8px 0}.weekday-grid label{display:flex;flex-direction:column;gap:3px;font-size:12px;width:84px}.weekday-grid input{width:100%;box-sizing:border-box;padding:8px}.weekday-grid small{color:#778;font-size:11px;min-height:14px}
+.price-cal td.cheaper{font-weight:700}tr.inherited td{color:#778}.country-card{border-top:1px solid #e6eaf0;padding-top:6px;margin-top:14px}
+.toggle.shift button{padding:10px 10px;font-size:13px}.toggle.shift button:nth-child(3){margin-right:6px;border-radius:0 8px 8px 0}.toggle.shift button:nth-child(4){border-radius:8px 0 0 8px}
+.stay-total{font-size:14px;color:#556;margin-top:2px}

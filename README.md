@@ -39,7 +39,7 @@ Then open:
 | PostgreSQL | `localhost:5433`, user / password / db `booking` |
 | Redis | `redis://localhost:6379` |
 
-The login page lists every account with its password; click a row to log in. On a fresh database only the admin exists (`admin@example.com` / `admin123`). Log in as admin and press **Generate Sample Data** to create 20 hotels, two sellers and two customers. Re-running it is safe.
+The login page lists every account with its password; click a row to log in. On a fresh database only the admin exists (`admin@example.com` / `admin123`). Log in as admin and press **Generate Sample Data** to create 20 hotels, two sellers and two customers, with example prices: Thailand's day-of-week defaults and high season (15 Dec – 15 Jan +40%), a fixed New Year's Eve price per room type, and an autumn discount on half of the hotels. Re-running it is safe.
 
 The login page also shows the catalogue at a glance (hotels, rooms, room-nights bookable right now) and the accounts in three tables: admins, sellers and customers.
 
@@ -52,7 +52,7 @@ podman compose up --build -d --force-recreate --no-deps api availability-worker 
 ## What you can do
 
 **As a customer**
-- Search hotels by country and city, pick check-in / check-out dates, open a hotel to see per-night availability and the total price for the stay.
+- Search hotels by country and city, pick check-in / check-out dates, open a hotel to see per-night availability, the price of every night (weekend, season and holiday prices marked) and the total for the stay.
 - Results show a **Sold out** badge when no room is free for every night of the selected dates, are paged (10 / 20 / 50 / 100 per page, pager above and below the results) and can be viewed as cards or as a compact list with a small picture.
 - Book a room: the nights are locked for you immediately and the booking is *Awaiting payment*. Pay within 60 seconds in **My bookings** or the status becomes *Payment timed out* and the room is released.
 - My bookings shows a live countdown, a Pay button, a Cancel button for upcoming stays, a stay-phase badge (Upcoming / Staying now / Completed) and a warning when two of your stays overlap.
@@ -60,6 +60,7 @@ podman compose up --build -d --force-recreate --no-deps api availability-worker 
 **As a seller**
 - **Dashboard**: stat tiles and charts (booked vs free rooms per night, occupancy per hotel) for the next 7 / 14 / 30 days, with a table view.
 - **My hotels**: only the hotels you own, with availability and the bookings on each. Search is scoped the same way, enforced by the API.
+- **Prices**: per hotel, set the base price of each room type, your own day-of-week % (an empty day uses the country default), and seasons, holidays and discounts for one room type or all. Prices stack: season × day of week − discount; a holiday replaces season and day of week. A 60-night calendar shows every room type's price, and hovering a price shows its layers. Existing bookings keep the price they were made at.
 
 **As an admin**
 - Generate / delete sample data, create sample bookings for a chosen customer, rebuild the Redis availability cache from PostgreSQL.
@@ -68,6 +69,7 @@ podman compose up --build -d --force-recreate --no-deps api availability-worker 
 - **Load simulation** with a report that ranks the slowest steps (p95) and a Cancel-all button:
   - *Random rooms this week*: N customers book random rooms at once, optionally only in one country or city; a share pays, a share lets the lock expire and rebooks, the rest abandon.
   - *Same room, 7 nights*: everyone wants one room; rejected customers cascade to another room type in the hotel, then to another hotel (anywhere, same country or same city).
+- **Country pricing**: each country's default day-of-week % (e.g. Israel Mon −15%, Thu +30%, Fri +40%, Sat +10%; Thailand Wed −10%, Fri +20%, Sat +30%) and national seasons and holidays. Every hotel in the country inherits them unless it overrides.
 - **Redis capacity test**: generate 1,000 to 1,000,000 sellers with 1, 10 or 100 hotels each (3 room types, 365 nights, spread over 20 cities in 6 countries). Hotels are loaded in batches of 250 until done, stopped, or Redis reaches `maxmemory`; the half-loaded batch is then rolled back. Tiles show Redis RAM, keys, bytes per key and progress. **Remove capacity-test data** deletes it all again.
 
 ![Admin load simulation report](docs/admin-simulation.png)
@@ -127,6 +129,13 @@ When Redis is full it refuses writes, so new bookings fail too. One key per room
 | GET | `/api/bookings/me` | customer |
 | GET | `/api/seller/dashboard?days=7` | seller |
 | GET | `/api/seller/hotels`, `/api/seller/hotels/:id/bookings` | seller |
+| GET | `/api/seller/hotels/:id/prices?from=&days=60` | seller, base prices, rules and price calendar |
+| PATCH | `/api/seller/rooms/:id` `{ price }` | seller, base price |
+| PUT | `/api/seller/hotels/:id/weekdays` `{ pct: (number or null)[7] }` | seller, day-of-week %, null = country default |
+| POST / DELETE | `/api/seller/hotels/:id/price-rules` `{ kind: SEASON/HOLIDAY/DISCOUNT, name, roomId?, startDate, endDate, adjustType, adjustValue }`, `/api/seller/price-rules/:id` | seller |
+| GET | `/api/admin/country-pricing` | admin |
+| PUT | `/api/admin/country-pricing/:country/weekdays` `{ pct: number[7] }` | admin |
+| POST / DELETE | `/api/admin/country-pricing/:country/rules` `{ kind: SEASON/HOLIDAY, … }`, `/api/admin/price-rules/:id` | admin |
 | GET | `/api/admin/users` | admin |
 | POST | `/api/admin/impersonate/:userId` | admin |
 | POST / DELETE | `/api/admin/sample-data` | admin |

@@ -80,6 +80,110 @@ function parseRange(checkIn: any, checkOut: any): { nights: string[] } | { error
   return { nights };
 }
 
+// ---- Pricing -------------------------------------------------------------
+// A night's price is built in layers (whole baht, never below 0):
+//   1. base: rooms.price
+//   2. HOLIDAY rule, if any: fixed price or base +/- %; skips steps 3-4
+//   3. SEASON rule: fixed price or base +/- %
+//   4. weekday %: the hotel's value for that day of the week, else the country's (country_pricing), else 0
+//   5. DISCOUNT: minus the single largest active hotel/room discount %
+// Inside one layer a room rule beats a hotel rule beats a country rule, then the newest wins.
+type PriceRule = { id: string; hotel_id: string | null; country: string | null; room_id: string | null; kind: 'SEASON'|'HOLIDAY'|'DISCOUNT';
+  name: string; start_date: string; end_date: string; adjust_type: 'PERCENT'|'FIXED'; adjust_value: number; created_at: Date };
+type Pricing = { hotels: Map<string, { country: string; weekdayPct: (number|null)[] }>; countryPct: Map<string, number[]>; rules: PriceRule[];
+  byHotel: Map<string, PriceRule[]>; byCountry: Map<string, PriceRule[]> };
+type PricedRoom = { id: string; hotel_id: string; price: any };
+const WEEKDAY_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const toPct = (a: any) => Array.from({ length: 7 }, (_, i) => a?.[i] == null ? null : Number(a[i]));
+const RULE_COLUMNS = `id, hotel_id, country, room_id, kind, name, to_char(start_date,'YYYY-MM-DD') AS start_date, to_char(end_date,'YYYY-MM-DD') AS end_date,
+  adjust_type, adjust_value::float AS adjust_value, created_at`;
+
+/** Everything needed to price rooms of these hotels: their country, weekday patterns and every applicable rule. */
+async function loadPricing(hotelIds: string[]): Promise<Pricing> {
+  const hotels = hotelIds.length ? (await pool.query(`SELECT id, country, weekday_pct FROM hotels WHERE id = ANY($1)`, [hotelIds])).rows : [];
+  const countries = [...new Set(hotels.map((h:any) => h.country as string))];
+  const [cp, rules] = await Promise.all([
+    pool.query(`SELECT country, weekday_pct FROM country_pricing WHERE country = ANY($1)`, [countries]),
+    pool.query(`SELECT ${RULE_COLUMNS} FROM price_rules WHERE hotel_id = ANY($1) OR country = ANY($2)`, [hotelIds, countries])]);
+  const group = (key: (r: PriceRule) => string | null) => rules.rows.reduce((m: Map<string, PriceRule[]>, r: PriceRule) => {
+    const k = key(r); if (k) m.set(k, [...(m.get(k) || []), r]); return m; }, new Map());
+  return { hotels: new Map(hotels.map((h:any) => [h.id, { country: h.country, weekdayPct: toPct(h.weekday_pct) }])),
+    countryPct: new Map(cp.rows.map((c:any) => [c.country, toPct(c.weekday_pct).map(x => x ?? 0)])), rules: rules.rows,
+    byHotel: group(r => r.hotel_id), byCountry: group(r => r.country) };
+}
+const ruleSource = (r: PriceRule) => r.room_id ? 'room' : r.hotel_id ? 'hotel' : 'country';
+const SOURCE_RANK = { room: 3, hotel: 2, country: 1 } as const;
+function pickRule(rules: PriceRule[]) {
+  let win: PriceRule | null = null;
+  for (const r of rules) if (!win || (SOURCE_RANK[ruleSource(r)] - SOURCE_RANK[ruleSource(win)] || r.created_at.getTime() - win.created_at.getTime()) > 0) win = r;
+  return win;
+}
+const signed = (n: number) => `${n > 0 ? '+' : n < 0 ? '−' : ''}${Math.abs(n)}%`;
+
+function priceNight(room: PricedRoom, night: string, P: Pricing) {
+  const hotel = P.hotels.get(room.hotel_id), country = hotel?.country;
+  const base = Number(room.price);
+  const candidates = [...(P.byHotel.get(room.hotel_id) || []), ...(country ? P.byCountry.get(country) || [] : [])];
+  const active = candidates.filter(r => night >= r.start_date && night <= r.end_date &&
+    (r.room_id ? r.room_id === room.id : r.hotel_id ? r.hotel_id === room.hotel_id : r.country === country));
+  const of = (kind: PriceRule['kind']) => active.filter(r => r.kind === kind);
+  const apply = (r: PriceRule) => r.adjust_type === 'FIXED' ? r.adjust_value : base * (1 + r.adjust_value / 100);
+  const describe = (r: PriceRule) => r.adjust_type === 'FIXED' ? `฿${r.adjust_value.toLocaleString('en')}` : signed(r.adjust_value);
+  const parts: { layer: string; source: string; name: string; change: string }[] = [];
+  let price = base;
+  const holiday = pickRule(of('HOLIDAY'));
+  if (holiday) { price = apply(holiday); parts.push({ layer: 'HOLIDAY', source: ruleSource(holiday), name: holiday.name, change: describe(holiday) }); }
+  else {
+    const season = pickRule(of('SEASON'));
+    if (season) { price = apply(season); parts.push({ layer: 'SEASON', source: ruleSource(season), name: season.name, change: describe(season) }); }
+    const dow = new Date(night + 'T00:00:00Z').getUTCDay();
+    const own = hotel?.weekdayPct[dow] ?? null, pct = own ?? (country ? P.countryPct.get(country)?.[dow] : 0) ?? 0;
+    if (pct) { price *= 1 + pct / 100; parts.push({ layer: 'WEEKDAY', source: own != null ? 'hotel' : 'country', name: WEEKDAY_SHORT[dow], change: signed(pct) }); }
+  }
+  const discount = of('DISCOUNT').sort((a, b) => b.adjust_value - a.adjust_value)[0];
+  if (discount) { price *= 1 - discount.adjust_value / 100; parts.push({ layer: 'DISCOUNT', source: ruleSource(discount), name: discount.name, change: signed(-discount.adjust_value) }); }
+  const label = parts.map(p => `${p.name} ${p.change}`).join(' · ');
+  // `rule` keeps the shape older clients and stored bookings use: the strongest layer, named by the full label.
+  return { night, price: Math.max(0, Math.round(price)), parts, label, rule: parts[0] ? { kind: parts[0].layer, name: label } : null };
+}
+/** Price of every night of a stay and the total. */
+function priceStay(room: PricedRoom, nights: string[], P: Pricing) {
+  const nightly = nights.map(n => priceNight(room, n, P));
+  return { total: nightly.reduce((a, n) => a + n.price, 0), nightly };
+}
+/** Cheapest stay per hotel: the room type with the lowest total for these nights. */
+async function cheapestStays(hotelIds: string[], nights: string[]) {
+  const out = new Map<string, number>();
+  if (!hotelIds.length) return out;
+  const [rooms, P] = await Promise.all([pool.query(`SELECT id, hotel_id, price FROM rooms WHERE hotel_id = ANY($1)`, [hotelIds]), loadPricing(hotelIds)]);
+  for (const rm of rooms.rows) { const t = priceStay(rm, nights, P).total; if (!out.has(rm.hotel_id) || t < out.get(rm.hotel_id)!) out.set(rm.hotel_id, t); }
+  return out;
+}
+// Sorting by the real price for the dates prices every matching hotel's stay; above this many hotels search sorts by
+// base price instead (a real site would read a precomputed price index).
+const PRICE_SORT_LIMIT = 5000;
+
+/** Validates a SEASON / HOLIDAY / DISCOUNT rule body; returns the normalised fields or an error message. */
+function parseRule(b: any, allowDiscount: boolean) {
+  const kinds = allowDiscount ? ['SEASON', 'HOLIDAY', 'DISCOUNT'] : ['SEASON', 'HOLIDAY'];
+  if (!kinds.includes(b.kind)) return { error: `kind must be ${kinds.join(', ')}` };
+  const name = String(b.name || '').trim().slice(0, 80) || ({ SEASON: 'Season', HOLIDAY: 'Holiday', DISCOUNT: 'Discount' } as any)[b.kind];
+  const start = b.startDate, end = b.endDate || b.startDate;
+  if (!DATE_RE.test(String(start)) || !DATE_RE.test(String(end))) return { error: 'Pick a start and an end date' };
+  if (end < start) return { error: 'The end date cannot be before the start date' };
+  const type = b.kind === 'DISCOUNT' ? 'PERCENT' : b.adjustType, value = Number(b.adjustValue);
+  if (b.kind === 'DISCOUNT' ? !(value >= 1 && value <= 90) : type === 'PERCENT' ? !(value >= -90 && value <= 500) : type === 'FIXED' ? !(value > 0 && value <= 10_000_000) : true)
+    return { error: b.kind === 'DISCOUNT' ? 'A discount must be between 1 and 90%' : 'Use a percentage between -90 and 500, or a fixed price above 0' };
+  return { kind: b.kind as string, name, start, end, type: type as string, value };
+}
+/** Validates 7 weekday percentages (Sun..Sat); null = inherit (hotel level only). */
+function parseWeekdays(pct: any, allowNull: boolean) {
+  if (!Array.isArray(pct) || pct.length !== 7) return { error: 'Send 7 values, Sunday to Saturday' };
+  const out = pct.map((v: any) => v === null || v === '' ? null : Number(v));
+  if (out.some((v: any) => v === null ? !allowNull : !(v >= -90 && v <= 500))) return { error: 'Each day must be between -90% and +500%' };
+  return { pct: out as (number|null)[] };
+}
+
 // ---- Redis availability (one counter per room per night) ---------------
 const nightKey = (roomId: string, night: string) => `availability:${roomId}:${night}`;
 
@@ -214,11 +318,13 @@ app.post('/api/auth/login', async (req: any, reply) => {
   return { token: app.jwt.sign({ id: u.id, role: u.role }), user: { id:u.id,email:u.email,name:u.name,role:u.role } };
 });
 
+// ?sort=price_asc|price_desc (default newest first). With dates, price = the cheapest room's total for the stay.
 app.get('/api/hotels', async (req: any) => {
   await tryAuth(req);
   const { country, city } = req.query;
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(100, Math.max(1, Number(req.query.limit) || 12));
   const offset = (page-1) * limit;
+  const byPrice = req.query.sort === 'price_asc' ? 1 : req.query.sort === 'price_desc' ? -1 : 0;
   const values:any[] = [];
   const conds: string[] = [];
   if (country) { values.push(country); conds.push(`h.country = $${values.length}`); }
@@ -226,30 +332,45 @@ app.get('/api/hotels', async (req: any) => {
   if (req.userCtx?.role === 'SELLER') { values.push(req.userCtx.id); conds.push(`h.seller_id = $${values.length}`); }
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const total = (await pool.query(`SELECT count(*)::int AS n FROM hotels h ${where}`, values)).rows[0].n;
-  values.push(limit, offset);
-  const r = await pool.query(`
-    SELECT h.id,h.name,h.address,h.city,h.country,h.description,
+  const range = req.query.checkIn && req.query.checkOut ? parseRange(req.query.checkIn, req.query.checkOut) : null;
+  const nights = range && 'nights' in range ? range.nights : null;
+  const select = `SELECT h.id,h.name,h.address,h.city,h.country,h.description,
       COALESCE((SELECT MIN(r.price) FROM rooms r WHERE r.hotel_id=h.id),0) AS "startingPrice",
       (SELECT hp.url FROM hotel_photos hp WHERE hp.hotel_id=h.id LIMIT 1) AS thumbnail
-    FROM hotels h
-    ${where}
-    ORDER BY h.created_at DESC, h.id
-    LIMIT $${values.length-1} OFFSET $${values.length}`, values);
-  // With ?checkIn&checkOut: soldOut = no room in the hotel has a free unit on every night (null if Redis has no data for those nights).
-  const range = req.query.checkIn && req.query.checkOut ? parseRange(req.query.checkIn, req.query.checkOut) : null;
-  if (range && 'nights' in range && r.rows.length) {
-    const rooms = await pool.query(`SELECT id, hotel_id FROM rooms WHERE hotel_id = ANY($1)`, [r.rows.map((h:any) => h.id)]);
-    const vals = rooms.rows.length ? await redis.mget(rooms.rows.flatMap((rm:any) => range.nights.map(n => nightKey(rm.id, n)))) : [];
+    FROM hotels h`;
+  let rows: any[], stays: Map<string, number> | null = null, priceSortApprox = false;
+  if (byPrice && nights && total <= PRICE_SORT_LIMIT) {
+    // Exact: price every matching hotel's stay, sort, then load just this page. Hotels without rooms go last.
+    const ids: string[] = (await pool.query(`SELECT h.id FROM hotels h ${where}`, values)).rows.map((x:any) => x.id);
+    stays = await cheapestStays(ids, nights);
+    const key = (hid: string) => stays!.has(hid) ? byPrice * stays!.get(hid)! : Infinity;
+    const pageIds = ids.sort((a, b) => key(a) - key(b) || a.localeCompare(b)).slice(offset, offset + limit);
+    const found = (await pool.query(`${select} WHERE h.id = ANY($1)`, [pageIds])).rows;
+    rows = pageIds.map(pid => found.find((h:any) => h.id === pid)).filter(Boolean);
+  } else {
+    priceSortApprox = !!(byPrice && nights);
+    const order = byPrice ? `"startingPrice" ${byPrice > 0 ? 'ASC' : 'DESC'}, h.id` : 'h.created_at DESC, h.id';
+    rows = (await pool.query(`${select} ${where} ORDER BY ${order} LIMIT $${values.length + 1} OFFSET $${values.length + 2}`, [...values, limit, offset])).rows;
+  }
+  // With dates: "from" = the cheapest room's stay (total, and average per night), and
+  // soldOut = no room in the hotel has a free unit on every night (null if Redis has no data for those nights).
+  if (nights && rows.length) {
+    const pageStays = stays ?? await cheapestStays(rows.map((h:any) => h.id), nights);
+    for (const h of rows) if (pageStays.has(h.id)) {
+      h.startingTotal = pageStays.get(h.id); h.startingPrice = Math.round(h.startingTotal / nights.length); h.priceForDates = true;
+    }
+    const rooms = await pool.query(`SELECT id, hotel_id FROM rooms WHERE hotel_id = ANY($1)`, [rows.map((h:any) => h.id)]);
+    const vals = rooms.rows.length ? await redis.mget(rooms.rows.flatMap((rm:any) => nights.map(n => nightKey(rm.id, n)))) : [];
     const free = new Map<string, number | null>();
     rooms.rows.forEach((rm:any, i:number) => {
-      const v = vals.slice(i * range.nights.length, (i + 1) * range.nights.length);
+      const v = vals.slice(i * nights.length, (i + 1) * nights.length);
       const roomFree = v.some(x => x === null) ? null : Math.min(...v.map(Number));
       const prev = free.has(rm.hotel_id) ? free.get(rm.hotel_id)! : 0;
       free.set(rm.hotel_id, prev === null || roomFree === null ? null : prev + Math.max(0, roomFree));
     });
-    for (const h of r.rows) { const f = free.has(h.id) ? free.get(h.id)! : 0; h.availableRooms = f; h.soldOut = f === null ? null : f === 0; }
+    for (const h of rows) { const f = free.has(h.id) ? free.get(h.id)! : 0; h.availableRooms = f; h.soldOut = f === null ? null : f === 0; }
   }
-  return { page, limit, total, items:r.rows };
+  return { page, limit, total, priceSortApprox, items: rows };
 });
 
 // Optional ?checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD; defaults to tonight.
@@ -264,23 +385,29 @@ app.get('/api/hotels/:id', async (req:any, reply) => {
   if (req.userCtx?.role === 'SELLER' && h.rows[0].seller_id !== req.userCtx.id) return reply.code(403).send({error:'This hotel belongs to another seller'});
   const rooms = await pool.query(`SELECT * FROM rooms WHERE hotel_id=$1 ORDER BY price`, [req.params.id]);
   const photos = await pool.query(`SELECT * FROM hotel_photos WHERE hotel_id=$1`, [req.params.id]);
+  const rules = await loadPricing([req.params.id]);
   const enriched = [];
   for (const room of rooms.rows) {
     const availableRooms = await availabilityFor(room.id, range.nights);
-    enriched.push({ ...room, availableRooms, nights: range.nights.length, totalPrice: Number(room.price) * range.nights.length });
+    const quote = priceStay(room, range.nights, rules);
+    enriched.push({ ...room, availableRooms, nights: range.nights.length, nightly: quote.nightly, totalPrice: quote.total,
+      avgNightly: Math.round(quote.total / range.nights.length) });
   }
+  enriched.sort((a, b) => a.totalPrice - b.totalPrice);
   return { ...h.rows[0], checkIn, checkOut, nights: range.nights.length, rooms:enriched, photos:photos.rows };
 });
 
 /** Reserves the nights in Redis, then persists the booking + outbox events. Throws {statusCode:409} when sold out. */
 async function createBooking(userId: string, r: any, checkIn: string, checkOut: string, nights: string[], status: 'PENDING'|'CONFIRMED' = 'PENDING', windowSeconds = PAYMENT_WINDOW_SECONDS) {
+  // Priced before the Redis reserve, so a pricing failure never leaves a lock behind. The booking keeps this price.
+  const quote = priceStay(r, nights, await loadPricing([r.hotel_id]));
   const keys = nights.map(n => nightKey(r.id, n));
   const t0 = performance.now();
   const remaining = Number(await redis.eval(RESERVE_LUA, keys.length, ...keys, String(r.total_rooms)));
   const redisMs = performance.now() - t0;
   if (remaining === -2) throw { ...NOT_LOADED, redisMs };
   if (remaining < 0) throw { statusCode: 409, message: 'No rooms available for the selected dates', redisMs };
-  const totalPrice = Number(r.price) * nights.length;
+  const totalPrice = quote.total;
   const t1 = performance.now();
   const client = await pool.connect();
   try {
@@ -288,16 +415,16 @@ async function createBooking(userId: string, r: any, checkIn: string, checkOut: 
     const bookingId=id();
     // PENDING = room locked while the customer pays; the expiry worker releases it if they don't.
     const ins = await client.query(
-      `INSERT INTO bookings(id,user_id,hotel_id,room_id,status,price,check_in,check_out,expires_at,paid_at)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $5='PENDING' THEN now() + ($9 * interval '1 second') END, CASE WHEN $5='CONFIRMED' THEN now() END)
+      `INSERT INTO bookings(id,user_id,hotel_id,room_id,status,price,check_in,check_out,expires_at,paid_at,price_breakdown)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8, CASE WHEN $5='PENDING' THEN now() + ($9 * interval '1 second') END, CASE WHEN $5='CONFIRMED' THEN now() END, $10)
        RETURNING expires_at AS "expiresAt"`,
-      [bookingId,userId,r.hotel_id,r.id,status,totalPrice,checkIn,checkOut,windowSeconds]
+      [bookingId,userId,r.hotel_id,r.id,status,totalPrice,checkIn,checkOut,windowSeconds,JSON.stringify(quote.nightly)]
     );
     const expiresAt = ins.rows[0].expiresAt;
     await addOutbox(client,'booking.created',bookingId,{bookingId,userId,hotelId:r.hotel_id,roomId:r.id,status,checkIn,checkOut,nights:nights.length,totalPrice,remaining,expiresAt});
     await addOutbox(client,'room.availability.changed',r.id,{roomId:r.id,checkIn,checkOut,remaining});
     await client.query('COMMIT');
-    return { bookingId, status, checkIn, checkOut, nights: nights.length, totalPrice, remaining, expiresAt, paymentWindowSeconds: status==='PENDING' ? windowSeconds : 0,
+    return { bookingId, status, checkIn, checkOut, nights: nights.length, totalPrice, priceBreakdown: quote.nightly, remaining, expiresAt, paymentWindowSeconds: status==='PENDING' ? windowSeconds : 0,
       timings: { redisMs, pgMs: performance.now() - t1 } };
   } catch(e) {
     await client.query('ROLLBACK');
@@ -328,7 +455,8 @@ app.get('/api/bookings/me', async (req:any) => {
       GREATEST(0, CEIL(EXTRACT(EPOCH FROM (b.expires_at - now()))))::int AS "secondsLeft",
       to_char(b.check_in,'YYYY-MM-DD') AS "checkIn", to_char(b.check_out,'YYYY-MM-DD') AS "checkOut",
       (b.check_out - b.check_in) AS nights,
-      h.id AS "hotelId", h.name AS "hotelName", h.city, r.name AS "roomName", r.price AS "nightlyPrice"
+      h.id AS "hotelId", h.name AS "hotelName", h.city, r.name AS "roomName",
+      round(b.price / GREATEST(1, b.check_out - b.check_in)) AS "nightlyPrice", b.price_breakdown AS "priceBreakdown"
     FROM bookings b JOIN hotels h ON h.id=b.hotel_id JOIN rooms r ON r.id=b.room_id
     WHERE b.user_id=$1 ORDER BY b.check_in DESC, b.created_at DESC`, [req.userCtx!.id]);
   const active = (b:any) => b.status === 'CONFIRMED' || b.status === 'PENDING';
@@ -475,6 +603,113 @@ app.get('/api/seller/hotels/:id/bookings', async (req:any, reply) => {
   return r.rows;
 });
 
+// ---- Seller price management ---------------------------------------------
+async function ownHotel(req: any, hotelId: string) {
+  return (await pool.query(`SELECT id, name, country FROM hotels WHERE id=$1 AND seller_id=$2`, [hotelId, req.userCtx!.id])).rows[0];
+}
+
+// Base prices, weekday % (hotel and inherited country values), rules (hotel + inherited country) and the resulting
+// price of every room for the next `days` nights (default 60).
+app.get('/api/seller/hotels/:id/prices', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  const hotel = await ownHotel(req, req.params.id);
+  if (!hotel) return reply.code(404).send({ error: 'Hotel not found' });
+  const from = DATE_RE.test(String(req.query.from)) ? String(req.query.from) : todayStr();
+  const days = Math.min(120, Math.max(1, Number(req.query.days) || 60));
+  const rooms = (await pool.query(`SELECT id, hotel_id, name, price, total_rooms FROM rooms WHERE hotel_id=$1 ORDER BY price, name`, [hotel.id])).rows;
+  const P = await loadPricing([hotel.id]);
+  const nights = Array.from({ length: days }, (_, i) => addDays(from, i));
+  const roomName = new Map(rooms.map((r:any) => [r.id, r.name]));
+  const order = { HOLIDAY: 0, SEASON: 1, DISCOUNT: 2 };
+  return { hotel, from, days, rooms,
+    countryPct: P.countryPct.get(hotel.country) ?? Array(7).fill(0), hotelPct: P.hotels.get(hotel.id)!.weekdayPct,
+    rules: P.rules.filter(r => r.end_date >= todayStr())
+      .sort((a, b) => order[a.kind] - order[b.kind] || a.start_date.localeCompare(b.start_date))
+      .map(r => ({ ...r, source: ruleSource(r), roomName: r.room_id ? roomName.get(r.room_id) : null })),
+    calendar: rooms.map((r:any) => ({ roomId: r.id, nightly: priceStay(r, nights, P).nightly })) };
+});
+
+app.patch('/api/seller/rooms/:id', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  const price = Number(req.body?.price);
+  if (!(price > 0 && price <= 10_000_000)) return reply.code(400).send({ error: 'Price must be between 1 and 10,000,000' });
+  const r = await pool.query(`UPDATE rooms r SET price=$1 FROM hotels h WHERE r.id=$2 AND h.id=r.hotel_id AND h.seller_id=$3 RETURNING r.id`,
+    [price, req.params.id, req.userCtx!.id]);
+  if (!r.rows[0]) return reply.code(404).send({ error: 'Room not found' });
+  return { ok: true };
+});
+
+// Hotel weekday %, Sunday..Saturday; null = use the country's value for that day.
+app.put('/api/seller/hotels/:id/weekdays', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  const hotel = await ownHotel(req, req.params.id);
+  if (!hotel) return reply.code(404).send({ error: 'Hotel not found' });
+  const w = parseWeekdays(req.body?.pct, true);
+  if ('error' in w) return reply.code(400).send({ error: w.error });
+  await pool.query(`UPDATE hotels SET weekday_pct=$1 WHERE id=$2`, [w.pct.every(v => v === null) ? null : w.pct, hotel.id]);
+  return { ok: true };
+});
+
+app.post('/api/seller/hotels/:id/price-rules', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  const hotel = await ownHotel(req, req.params.id);
+  if (!hotel) return reply.code(404).send({ error: 'Hotel not found' });
+  const b = req.body || {}, r = parseRule(b, true);
+  if ('error' in r) return reply.code(400).send({ error: r.error });
+  if (b.roomId && !(await pool.query(`SELECT 1 FROM rooms WHERE id=$1 AND hotel_id=$2`, [b.roomId, hotel.id])).rows[0])
+    return reply.code(400).send({ error: 'That room is not in this hotel' });
+  const ins = await pool.query(
+    `INSERT INTO price_rules(id,hotel_id,room_id,kind,name,start_date,end_date,adjust_type,adjust_value) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [id(), hotel.id, b.roomId || null, r.kind, r.name, r.start, r.end, r.type, r.value]);
+  return { ok: true, id: ins.rows[0].id };
+});
+
+app.delete('/api/seller/price-rules/:id', async (req:any, reply) => {
+  await auth(req, ['SELLER']);
+  // Country rules have no hotel_id, so a seller can never delete them.
+  const r = await pool.query(`DELETE FROM price_rules pr USING hotels h WHERE pr.id=$1 AND h.id=pr.hotel_id AND h.seller_id=$2 RETURNING pr.id`,
+    [req.params.id, req.userCtx!.id]);
+  if (!r.rows[0]) return reply.code(404).send({ error: 'Price rule not found' });
+  return { ok: true };
+});
+
+// ---- Admin: country pricing defaults ---------------------------------------
+app.get('/api/admin/country-pricing', async (req:any) => {
+  await auth(req, ['ADMIN']);
+  const r = await pool.query(`
+    SELECT c.country, cp.weekday_pct,
+      (SELECT count(*)::int FROM hotels h WHERE h.country=c.country) AS hotels,
+      (SELECT count(*)::int FROM hotels h WHERE h.country=c.country AND h.weekday_pct IS NOT NULL) AS "hotelsWithOwnWeekdays"
+    FROM (SELECT DISTINCT country FROM hotels UNION SELECT country FROM country_pricing) c
+    LEFT JOIN country_pricing cp ON cp.country=c.country ORDER BY c.country`);
+  const rules = (await pool.query(`SELECT ${RULE_COLUMNS} FROM price_rules WHERE country IS NOT NULL AND end_date >= $1 ORDER BY start_date`, [todayStr()])).rows;
+  return r.rows.map((c:any) => ({ country: c.country, hotels: c.hotels, hotelsWithOwnWeekdays: c.hotelsWithOwnWeekdays,
+    weekdayPct: toPct(c.weekday_pct).map(x => x ?? 0), rules: rules.filter((x:any) => x.country === c.country) }));
+});
+app.put('/api/admin/country-pricing/:country/weekdays', async (req:any, reply) => {
+  await auth(req, ['ADMIN']);
+  const w = parseWeekdays(req.body?.pct, false);
+  if ('error' in w) return reply.code(400).send({ error: w.error });
+  await pool.query(`INSERT INTO country_pricing(country, weekday_pct) VALUES($1,$2) ON CONFLICT (country) DO UPDATE SET weekday_pct=EXCLUDED.weekday_pct`,
+    [req.params.country, w.pct]);
+  return { ok: true };
+});
+app.post('/api/admin/country-pricing/:country/rules', async (req:any, reply) => {
+  await auth(req, ['ADMIN']);
+  const r = parseRule(req.body || {}, false);
+  if ('error' in r) return reply.code(400).send({ error: r.error });
+  const ins = await pool.query(
+    `INSERT INTO price_rules(id,country,kind,name,start_date,end_date,adjust_type,adjust_value) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [id(), req.params.country, r.kind, r.name, r.start, r.end, r.type, r.value]);
+  return { ok: true, id: ins.rows[0].id };
+});
+app.delete('/api/admin/price-rules/:id', async (req:any, reply) => {
+  await auth(req, ['ADMIN']);
+  const r = await pool.query(`DELETE FROM price_rules WHERE id=$1 AND country IS NOT NULL RETURNING id`, [req.params.id]);
+  if (!r.rows[0]) return reply.code(404).send({ error: 'Country rule not found' });
+  return { ok: true };
+});
+
 app.get('/api/admin/users', async (req:any,reply) => {
   await auth(req,['ADMIN']);
   const r=await pool.query(`SELECT id,email,name,role FROM users WHERE NOT is_load_test ORDER BY created_at DESC`);
@@ -490,6 +725,23 @@ app.post('/api/admin/impersonate/:userId', async (req:any,reply) => {
     [id(),req.userCtx!.id,u.id]);
   return { token: app.jwt.sign({id:u.id,role:u.role,impersonatedBy:req.userCtx!.id}), user:u };
 });
+
+// Example hotel rules so layered prices show right away: New Year's Eve at a fixed price per room type, and an
+// "Autumn deal" discount on even-numbered sample hotels. Weekday % and seasons come from the country defaults.
+// Only for sample hotels that have no rules yet.
+async function ensureSamplePriceRules() {
+  const t = todayStr(), y = Number(t.slice(0, 4));
+  const sy = t > `${y}-01-15` ? y : y - 1; // the New Year that is coming next
+  const hotels = (await pool.query(`SELECT id FROM hotels h WHERE is_sample AND NOT EXISTS (SELECT 1 FROM price_rules p WHERE p.hotel_id=h.id)`)).rows.map((h:any) => h.id);
+  if (!hotels.length) return 0;
+  await pool.query(`INSERT INTO price_rules(id,hotel_id,room_id,kind,name,start_date,end_date,adjust_type,adjust_value)
+    SELECT gen_random_uuid(), r.hotel_id, r.id, 'HOLIDAY', 'New Year''s Eve', $2, $2, 'FIXED', round(r.price * 2.5 / 100) * 100
+    FROM rooms r WHERE r.hotel_id = ANY($1)`, [hotels, `${sy}-12-31`]);
+  await pool.query(`INSERT INTO price_rules(id,hotel_id,kind,name,start_date,end_date,adjust_type,adjust_value)
+    SELECT gen_random_uuid(), h.id, 'DISCOUNT', 'Autumn deal', $2, $3, 'PERCENT', 10
+    FROM hotels h WHERE h.id = ANY($1) AND (regexp_replace(h.name,'\D','','g'))::int % 2 = 0`, [hotels, `${sy}-10-01`, `${sy}-11-30`]);
+  return hotels.length;
+}
 
 // Idempotent: re-running it ensures the sample users exist and only creates hotels when there are none yet.
 app.post('/api/admin/sample-data', async (req:any) => {
@@ -537,6 +789,7 @@ app.post('/api/admin/sample-data', async (req:any) => {
     await client.query('COMMIT');
     // Every room's availability must be in Redis before it can be booked.
     await seedRoomAvailability(newRooms);
+    await ensureSamplePriceRules();
     return {ok:true,
       message: hotelsCreated ? `Sample data generated (${hotelsCreated} hotels, 4 users)` : 'Sample users ensured; sample hotels already existed',
       login:{customer:'customer@example.com / customer123',customer2:'customer2@example.com / customer123',seller:'seller@example.com / seller123',seller2:'seller2@example.com / seller123'}};
@@ -565,7 +818,7 @@ app.post('/api/admin/sample-bookings', async (req:any, reply) => {
   await pool.query(
     `INSERT INTO bookings(id,user_id,hotel_id,room_id,status,price,check_in,check_out,paid_at)
      VALUES($1,$2,$3,$4,'CONFIRMED',$5,$6,$7,now() - interval '10 days')`,
-    [id(), userId, past.hotel_id, past.id, Number(past.price) * 3, addDays(t, -7), addDays(t, -4)]);
+    [id(), userId, past.hotel_id, past.id, priceStay(past, nightsOf(addDays(t, -7), addDays(t, -4)), await loadPricing([past.hotel_id])).total, addDays(t, -7), addDays(t, -4)]);
   const created: any[] = [], skipped: any[] = [];
   for (const pl of plans) {
     const range = parseRange(pl.checkIn, pl.checkOut);
@@ -1206,6 +1459,48 @@ app.get('/api/admin/availability-log', async (req:any) => {
 });
 
 // Idempotent schema upgrades for databases created before date-range bookings existed.
+// Layered pricing schema: country defaults, hotel weekday %, and price_rules scoped to a country or a hotel.
+async function migratePricing() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS country_pricing (country TEXT PRIMARY KEY, weekday_pct NUMERIC(6,2)[] NOT NULL DEFAULT '{0,0,0,0,0,0,0}')`);
+  await pool.query(`ALTER TABLE hotels ADD COLUMN IF NOT EXISTS weekday_pct NUMERIC(6,2)[]`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS price_rules (
+    id UUID PRIMARY KEY, hotel_id UUID REFERENCES hotels(id) ON DELETE CASCADE, country TEXT, room_id UUID REFERENCES rooms(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('SEASON','HOLIDAY','DISCOUNT')), name TEXT NOT NULL, start_date DATE NOT NULL, end_date DATE NOT NULL,
+    adjust_type TEXT NOT NULL CHECK (adjust_type IN ('PERCENT','FIXED')), adjust_value NUMERIC(12,2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(), CHECK (end_date >= start_date),
+    CONSTRAINT price_rules_scope_check CHECK ((country IS NULL) <> (hotel_id IS NULL) AND (room_id IS NULL OR hotel_id IS NOT NULL)))`);
+  // Databases from the first pricing version: WEEKEND rules become hotel weekday %, sample weekend/season rules
+  // give way to the country defaults, and rules may now belong to a country.
+  const old = (await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_name='price_rules' AND column_name='weekdays'`)).rows.length;
+  if (old) {
+    const weekend = (await pool.query(`SELECT pr.hotel_id, pr.weekdays, pr.adjust_value::float AS v FROM price_rules pr JOIN hotels h ON h.id=pr.hotel_id
+      WHERE pr.kind='WEEKEND' AND pr.adjust_type='PERCENT' AND NOT h.is_sample ORDER BY pr.created_at`)).rows;
+    for (const w of weekend) await pool.query(`UPDATE hotels SET weekday_pct = (SELECT array_agg(CASE WHEN i-1 = ANY($2::int[]) THEN $3::numeric
+      ELSE (COALESCE(weekday_pct, array_fill(NULL::numeric, ARRAY[7])))[i] END ORDER BY i) FROM generate_series(1,7) i) WHERE id=$1`, [w.hotel_id, w.weekdays, w.v]);
+    await pool.query(`DELETE FROM price_rules WHERE kind='WEEKEND'`);
+    await pool.query(`DELETE FROM price_rules pr USING hotels h WHERE pr.hotel_id=h.id AND h.is_sample AND pr.kind='SEASON' AND pr.name='High season'`);
+    await pool.query(`ALTER TABLE price_rules DROP COLUMN weekdays, ADD COLUMN IF NOT EXISTS country TEXT, ALTER COLUMN hotel_id DROP NOT NULL`);
+    await pool.query(`ALTER TABLE price_rules DROP CONSTRAINT IF EXISTS price_rules_kind_check`);
+    await pool.query(`ALTER TABLE price_rules ADD CONSTRAINT price_rules_kind_check CHECK (kind IN ('SEASON','HOLIDAY','DISCOUNT'))`);
+    await pool.query(`ALTER TABLE price_rules ADD CONSTRAINT price_rules_scope_check CHECK ((country IS NULL) <> (hotel_id IS NULL) AND (room_id IS NULL OR hotel_id IS NOT NULL))`);
+    app.log.info({ convertedWeekendRules: weekend.length }, 'pricing migrated to country + hotel layers');
+  }
+  await pool.query(`CREATE INDEX IF NOT EXISTS price_rules_hotel_idx ON price_rules(hotel_id)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS price_rules_country_idx ON price_rules(country) WHERE country IS NOT NULL`);
+  // Country defaults (Sunday..Saturday %), only where the admin has not set any yet.
+  const defaults: [string, number[]][] = [
+    ['Israel', [0, -15, 0, 0, 30, 40, 10]], ['Thailand', [0, 0, 0, -10, 0, 20, 30]], ['Japan', [0, 0, 0, 0, 0, 15, 25]],
+    ['Vietnam', [0, 0, 0, 0, 0, 10, 20]], ['Italy', [0, 0, 0, 0, 0, 15, 20]], ['France', [0, 0, 0, 0, 0, 10, 20]]];
+  for (const [c, pct] of defaults) await pool.query(`INSERT INTO country_pricing(country, weekday_pct) VALUES($1,$2) ON CONFLICT DO NOTHING`, [c, pct]);
+  // Country seasons, only for countries without any country rule yet: Thai high season, Israeli summer.
+  const t = todayStr(), y = Number(t.slice(0, 4));
+  const winter = t > `${y}-01-15` ? y : y - 1, summer = t > `${y}-08-31` ? y + 1 : y;
+  const seasons: [string, string, string, string, number][] = [
+    ['Thailand', 'High season', `${winter}-12-15`, `${winter + 1}-01-15`, 40], ['Israel', 'Summer', `${summer}-07-01`, `${summer}-08-31`, 25]];
+  for (const [c, name, start, end, v] of seasons) await pool.query(`INSERT INTO price_rules(id,country,kind,name,start_date,end_date,adjust_type,adjust_value)
+    SELECT $1,$2,'SEASON',$3,$4,$5,'PERCENT',$6 WHERE NOT EXISTS (SELECT 1 FROM price_rules WHERE country=$2)`, [id(), c, name, start, end, v]);
+}
+
 async function migrate() {
   await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS check_in DATE`);
   await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS check_out DATE`);
@@ -1222,8 +1517,10 @@ async function migrate() {
     id UUID PRIMARY KEY, status TEXT NOT NULL, params JSONB NOT NULL DEFAULT '{}'::jsonb, report JSONB NOT NULL DEFAULT '{}'::jsonb,
     customer_ids UUID[] NOT NULL DEFAULT '{}', created_by UUID, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ)`);
   for (const t of ['users', 'hotels', 'rooms']) await pool.query(`ALTER TABLE ${t} ADD COLUMN IF NOT EXISTS is_load_test BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`ALTER TABLE bookings ADD COLUMN IF NOT EXISTS price_breakdown JSONB`);
   // All hotels created before countries existed are in Thai cities.
   await pool.query(`ALTER TABLE hotels ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'Thailand'`);
+  await migratePricing();
   await pool.query(`CREATE INDEX IF NOT EXISTS hotels_location_idx ON hotels(country, city)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS hotels_created_idx ON hotels(created_at DESC, id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS hotel_photos_hotel_idx ON hotel_photos(hotel_id)`);
