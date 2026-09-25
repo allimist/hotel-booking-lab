@@ -31,7 +31,7 @@ Then open:
 | What | Where |
 |---|---|
 | Web app | http://localhost:5173 |
-| API | http://localhost:3000/api/health |
+| API | http://localhost:3010/api/health |
 | Kafka UI | http://localhost:8080 |
 | PostgreSQL | `localhost:5433`, user / password / db `booking` |
 | Redis | `redis://localhost:6379` |

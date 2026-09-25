@@ -5,5 +5,4 @@ RUN npm install
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
-EXPOSE 3010
 CMD ["npm","start"]
