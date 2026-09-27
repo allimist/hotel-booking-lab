@@ -13,8 +13,8 @@ Everything runs locally with Docker Compose or Podman Compose. Nothing is produc
 | API | Node.js 22, TypeScript, Fastify 5 | small, fast, typed REST API |
 | Web | React 19, Vite 8, TypeScript | single-file SPA, inline SVG charts |
 | Source of truth | PostgreSQL 16 | users, hotels, rooms, bookings, audit log, outbox, simulation runs |
-| Inventory / locks | Redis 7 + Lua | one counter per room per night for the next 365 nights, atomic all-or-nothing reservation; capped with `maxmemory` |
-| Availability worker | Node.js 22, TypeScript | rolls the 365-night Redis window once a day (adds the new night, removes yesterday) |
+| Inventory / locks | Redis 7 + Lua | booked counts only (one small hash per room type and month, an entry only for booked nights), atomic all-or-nothing reservation; capped with `maxmemory` |
+| Availability worker | Node.js 22, TypeScript | removes past nights from Redis once a day |
 | Events | Apache Kafka 3.9 (KRaft) + Kafka UI | domain events published from the outbox |
 | Auth | JWT | roles CUSTOMER / SELLER / ADMIN, admin impersonation with audit trail |
 | Containers | Docker Compose / Podman Compose | healthchecks, dependency ordering |
@@ -70,18 +70,19 @@ podman compose up --build -d --force-recreate --no-deps api availability-worker 
   - *Random rooms this week*: N customers book random rooms at once, optionally only in one country or city; a share pays, a share lets the lock expire and rebooks, the rest abandon.
   - *Same room, 7 nights*: everyone wants one room; rejected customers cascade to another room type in the hotel, then to another hotel (anywhere, same country or same city).
 - **Country pricing**: each country's default day-of-week % (e.g. Israel Mon −15%, Thu +30%, Fri +40%, Sat +10%; Thailand Wed −10%, Fri +20%, Sat +30%) and national seasons and holidays. Every hotel in the country inherits them unless it overrides.
-- **Redis capacity test**: generate 1,000 to 1,000,000 sellers with 1, 10 or 100 hotels each (3 room types, 365 nights, spread over 20 cities in 6 countries). Hotels are loaded in batches of 250 until done, stopped, or Redis reaches `maxmemory`; the half-loaded batch is then rolled back. Tiles show Redis RAM, keys, bytes per key and progress. **Remove capacity-test data** deletes it all again.
+- **Redis capacity test**: generate 1,000 to 1,000,000 sellers with 1, 10 or 100 hotels each (3 room types, spread over 20 cities in 6 countries), with 0, 10, 50 or 90% of the next 365 nights booked. Hotels alone cost no Redis memory; the occupancy is written to Redis as synthetic booked counts (Redis only) to measure how memory grows with bookings. It runs in batches of 250 until done, stopped, or Redis reaches `maxmemory`; the half-written batch is then rolled back. Tiles show Redis RAM, keys, bytes per key and progress. **Remove capacity-test data** deletes it all again.
 
 ![Admin load simulation report](docs/admin-simulation.png)
 
 ## How the booking flow works
 
-1. `POST /api/bookings` runs one Lua script over every night of the stay. If any night is sold out it returns -1 and changes nothing; otherwise it decrements all nights atomically. No database lock is needed and concurrent requests cannot oversell.
-2. The booking row is inserted as `PENDING` with `expires_at = now() + 60s`, together with `booking.created` and `room.availability.changed` rows in the `outbox_events` table, in the same transaction.
-3. `POST /api/bookings/:id/pay` is a single conditional `UPDATE ... WHERE status='PENDING' AND expires_at > now()`, so a late payment and the expiry worker can never both win.
-4. A worker moves expired `PENDING` rows to `PAYMENT_TIMEOUT` (`FOR UPDATE SKIP LOCKED`), gives the nights back to Redis and writes `booking.payment_timeout`.
-5. The outbox publisher sends unpublished events to Kafka and stamps `published_at`. Watch the topics in Kafka UI: `booking.created`, `booking.confirmed`, `booking.payment_timeout`, `booking.cancelled`, `room.availability.changed`.
-6. Redis is treated as a cache: at startup (and from the admin panel) the per-night counters are rebuilt from the bookings table, 200 rooms at a time. The availability worker keeps exactly 365 nights per room loaded, rolling the window after UTC midnight.
+1. `POST /api/bookings` runs one Lua script over every night of the stay. Redis stores how many rooms are booked per night (nothing stored = all free), and capacity comes from PostgreSQL. If any night is full it returns -1 and changes nothing; otherwise it adds 1 to every night atomically, so concurrent requests cannot oversell.
+2. Inside the booking transaction PostgreSQL has the last word: it locks the room type and counts active bookings per night. If Redis was ever wrong (lost writes, a rebuild racing a booking) the booking is rejected as sold out instead of overbooking.
+3. The booking row is inserted as `PENDING` with `expires_at = now() + 60s`, together with `booking.created` and `room.availability.changed` rows in the `outbox_events` table, in the same transaction.
+4. `POST /api/bookings/:id/pay` is a single conditional `UPDATE ... WHERE status='PENDING' AND expires_at > now()`, so a late payment and the expiry worker can never both win.
+5. A worker moves expired `PENDING` rows to `PAYMENT_TIMEOUT` (`FOR UPDATE SKIP LOCKED`), gives the nights back to Redis and writes `booking.payment_timeout`.
+6. The outbox publisher sends unpublished events to Kafka and stamps `published_at`. Watch the topics in Kafka UI: `booking.created`, `booking.confirmed`, `booking.payment_timeout`, `booking.cancelled`, `room.availability.changed`.
+7. Redis is treated as a cache: at startup (and from the admin panel) the booked counts are rebuilt from the bookings table, and until that has run once (key `av:loaded`) bookings are refused rather than treating an empty Redis as "all free". Month keys expire after their month; the availability worker also removes past nights daily.
 
 More detail in [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -101,17 +102,15 @@ The publisher (1.5 s poll, one Kafka send per event) is the bottleneck by two or
 
 ## What the Redis capacity test showed
 
-Podman VM with 2 GB RAM, Redis capped at 400 MB:
+Podman VM with 2 GB RAM, Redis capped at 400 MB. Memory per hotel (3 room types, next 365 nights):
 
-| Measure | Result |
-|---|---|
-| Memory per availability key | ~110 bytes (key name ~60 chars + Redis bookkeeping) |
-| Memory per hotel (3 room types × 365 nights) | ~120 KB |
-| Load speed | ~600,000 keys / s (1,000 hotels in 1.6 s) |
-| Full at | ~4.1 million keys ≈ 3,750 hotels |
-| Remove 3,750 hotels | ~7 s |
+| Booked | One key per room per night (before) | Booked counts only (now) |
+|---|---|---|
+| 0% | ~120 KB | ~0 (10,000 hotels: +20 KB in total) |
+| 10% | ~120 KB | ~7.9 KB |
+| 90% | ~120 KB | ~11 KB |
 
-When Redis is full it refuses writes, so new bookings fail too. One key per room per night means memory grows with the catalogue, not with bookings: 10,000 hotels need ~1.2 GB, 1,000,000 hotels ~120 GB. Storing only booked nights (capacity minus bookings, one small hash per room per month) would make memory grow with bookings instead; that is the planned next step.
+Before, memory grew with the catalogue: Redis was full at ~3,750 hotels and 1,000,000 hotels would need ~120 GB. Now it grows with bookings: 400 MB holds ~50,000 hotels at 10% occupancy or ~36,000 at 90%, and 1,000,000 hotels need ~8 GB at 10%. Rebuilding Redis from the sample bookings takes ~30 ms. When Redis is full it refuses writes, so new bookings fail too.
 
 ## API overview
 

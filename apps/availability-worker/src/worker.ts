@@ -1,8 +1,9 @@
-// Availability window roller.
-// Keeps Redis holding exactly AVAILABILITY_DAYS nights per room: today .. today+AVAILABILITY_DAYS-1.
-// Once a day (just after UTC midnight) it adds the night that just entered the window and removes the night
-// that just left it (yesterday). Each run is idempotent and catches up on missed days, so it is safe to
-// restart, run late, or run more than once. Every run is recorded in availability_window_log (shown in the admin UI).
+// Availability cleanup worker.
+// Redis holds booked counts per room and month (hash av:{roomId}:YYYY-MM, one field per booked night; see the API).
+// Month keys expire by themselves two days after their month ends. Once a day, just after UTC midnight, this worker
+// also removes the nights that are already past from the current and previous month's keys, so Redis only holds
+// bookings for today onwards. Each run is idempotent and catches up on missed days. Every run is recorded in
+// availability_window_log (shown in the admin UI as "Availability log").
 import { Pool } from 'pg';
 import Redis from 'ioredis';
 
@@ -12,8 +13,7 @@ const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
 const AVAILABILITY_DAYS = Number(process.env.AVAILABILITY_DAYS || 365);
 const RETRY_MS = 60_000;
 
-// Same key format and calendar (UTC YYYY-MM-DD) as the API.
-const nightKey = (roomId: string, night: string) => `availability:${roomId}:${night}`;
+// Same calendar (UTC YYYY-MM-DD) and key format as the API: av:{roomId}:YYYY-MM, field = day of month.
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function addDays(d: string, n: number) {
   const t = new Date(d + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10);
@@ -45,43 +45,23 @@ async function writeLog(e: { trigger: Trigger; status: 'OK' | 'FAILED'; first: s
     [e.trigger, e.status, e.first, e.last, sum(e.added), sum(e.removed), JSON.stringify(e.added), JSON.stringify(e.removed), e.ms, e.error ?? null]);
 }
 
-/** Adds every missing night inside the window. SET NX never touches a live counter. */
-async function addMissingNights(first: string, last: string) {
-  const added = new Map<string, number>();
-  let after = '00000000-0000-0000-0000-000000000000';
-  // 200 rooms (73k room-nights) per query, so a large catalogue (the API's Redis capacity test) never has to fit in memory at once.
-  while (true) {
-    // A missing night gets total_rooms minus the active bookings covering it (normally none that far ahead).
-    const r = await pool.query(`
-      WITH rs AS (SELECT id, total_rooms FROM rooms WHERE id > $3 ORDER BY id LIMIT 200)
-      SELECT rs.id AS room_id, rs.total_rooms, to_char(d.night,'YYYY-MM-DD') AS night, count(b.id)::int AS booked
-      FROM rs
-      CROSS JOIN generate_series($1::date, $2::date, '1 day') AS d(night)
-      LEFT JOIN bookings b ON b.room_id=rs.id AND b.status IN ('CONFIRMED','PENDING') AND b.check_in <= d.night AND b.check_out > d.night
-      GROUP BY rs.id, rs.total_rooms, d.night`, [first, last, after]);
-    if (!r.rows.length) break;
-    const pipe = redis.pipeline();
-    for (const row of r.rows) {
-      pipe.set(nightKey(row.room_id, row.night), String(Math.max(0, row.total_rooms - row.booked)), 'NX');
-      if (row.room_id > after) after = row.room_id;
-    }
-    const res = await pipe.exec();
-    const failed = res!.find(([err]) => err);
-    if (failed) throw failed[0]; // e.g. OOM: Redis is at maxmemory
-    res!.forEach(([, v], i) => { if (v === 'OK') bump(added, r.rows[i].night); });
-  }
-  return perNight(added);
-}
-
-/** Removes every night outside the window: yesterday (and older, if a day was missed) and anything too far ahead. */
-async function removeNightsOutside(first: string, last: string) {
+/** Removes booked nights before `today`: whole keys of the previous month, past days of the current month. */
+async function removePastNights(today: string) {
   const removed = new Map<string, number>();
-  const stream = redis.scanStream({ match: 'availability:*', count: 1000 });
-  for await (const keys of stream as AsyncIterable<string[]>) {
-    const outside = keys.filter(k => { const night = k.slice(-10); return night < first || night > last; });
-    if (!outside.length) continue;
-    await redis.unlink(...outside);
-    for (const k of outside) bump(removed, k.slice(-10));
+  const thisMonth = today.slice(0, 7), lastMonth = addDays(`${thisMonth}-01`, -1).slice(0, 7);
+  for (const month of [lastMonth, thisMonth]) {
+    for await (const keys of redis.scanStream({ match: `av:{*}:${month}`, count: 1000 }) as AsyncIterable<string[]>) {
+      if (!keys.length) continue;
+      const all = await redis.pipeline(keys.map(k => ['hkeys', k])).exec();
+      const del = redis.pipeline();
+      keys.forEach((k, i) => {
+        const past = (all![i][1] as string[]).filter(f => month < thisMonth || Number(f) < Number(today.slice(8)));
+        if (!past.length) return;
+        del.hdel(k, ...past);
+        for (const f of past) bump(removed, `${month}-${f.padStart(2, '0')}`);
+      });
+      await del.exec();
+    }
   }
   return perNight(removed);
 }
@@ -90,11 +70,11 @@ async function roll(trigger: Trigger) {
   const t0 = performance.now();
   const first = todayStr();
   const last = addDays(first, AVAILABILITY_DAYS - 1);
-  let added: NightCount[] = [], removed: NightCount[] = [];
+  const added: NightCount[] = []; // nothing is ever added: bookings write their own nights
+  let removed: NightCount[] = [];
   try {
     await ensureLogTable();
-    added = await addMissingNights(first, last);
-    removed = await removeNightsOutside(first, last);
+    removed = await removePastNights(first);
   } catch (err) {
     // Best effort: PostgreSQL itself may be what failed.
     await writeLog({ trigger, status: 'FAILED', first, last, added, removed, ms: Math.round(performance.now() - t0), error: String(err) }).catch(() => {});

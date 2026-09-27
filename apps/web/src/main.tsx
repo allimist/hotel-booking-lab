@@ -243,10 +243,10 @@ function RedisRecords({hotels,onMessage}:{hotels:any[],onMessage:(m:string)=>voi
   return <section className="card admin">
     <div className="row between"><h2>Redis records</h2><button onClick={load}>Refresh</button></div>
     <div className="tiles">
-      <div className="tile"><div className="tile-label">Keys in Redis</div><div className="tile-value">{s.totalKeys.toLocaleString()}</div><div className="tile-hint">expected {s.expectedKeys.toLocaleString()} ({s.rooms} rooms × {s.windowDays} nights)</div></div>
-      <div className="tile"><div className="tile-label">First night</div><div className="tile-value small">{s.firstNight?fmt(s.firstNight):'—'}</div><div className="tile-hint">expected {fmt(s.expectedFirstNight)}</div></div>
-      <div className="tile"><div className="tile-label">Last night</div><div className="tile-value small">{s.lastNight?fmt(s.lastNight):'—'}</div><div className="tile-hint">expected {fmt(s.expectedLastNight)}</div></div>
-      <div className="tile"><div className="tile-label">Window</div><div className={`tile-value small ${s.windowOk?'ok':'bad'}`}>{s.windowOk?'✓ Exact':'✕ Off'}</div><div className="tile-hint">{s.windowHint}</div></div>
+      <div className="tile"><div className="tile-label">Keys in Redis</div><div className="tile-value">{s.totalKeys.toLocaleString()}</div><div className="tile-hint">one per room type and month that has bookings, for {s.rooms.toLocaleString()} room types</div></div>
+      <div className="tile"><div className="tile-label">Booked room-nights</div><div className="tile-value small">{s.bookedRoomNights.toLocaleString()}</div><div className="tile-hint">on {s.checkedRoomNights.toLocaleString()} room-nights in PostgreSQL (next {s.windowDays} nights, capacity-test rooms not counted)</div></div>
+      <div className="tile"><div className="tile-label">Redis vs PostgreSQL</div><div className={`tile-value small ${s.mismatches?'bad':'ok'}`}>{s.mismatches?`✕ ${s.mismatches} differ`:'✓ Match'}</div><div className="tile-hint">booked count of every booked night compared</div></div>
+      <div className="tile"><div className="tile-label">Loaded</div><div className={`tile-value small ${s.loadedAt?'ok':'bad'}`}>{s.loadedAt?'✓ Yes':'✕ No'}</div><div className="tile-hint">{s.loadedAt?`rebuilt ${new Date(s.loadedAt).toLocaleString()}`:'bookings are refused until the rebuild runs'}</div></div>
       <div className="tile"><div className="tile-label">Redis RAM</div><div className="tile-value small">{bytes(s.memory.usedBytes)}</div><div className="tile-hint">data {bytes(s.memory.datasetBytes)} · peak {bytes(s.memory.peakBytes)} · limit {s.memory.maxBytes?bytes(s.memory.maxBytes):'none'}</div></div>
     </div>
     <div className="row">
@@ -254,9 +254,10 @@ function RedisRecords({hotels,onMessage}:{hotels:any[],onMessage:(m:string)=>voi
       <label>Night<input type="date" value={night} onChange={e=>{setNight(e.target.value);setPage(1)}}/></label>
       {night&&<button onClick={()=>{setNight('');setPage(1)}}>Clear night</button>}
     </div>
-    <div className="tablewrap"><table><thead><tr><th>Night</th><th>Hotel</th><th>Room</th><th>Available</th><th>Total rooms</th><th>Key</th></tr></thead><tbody>
-      {data.items.map((x:any)=><tr key={x.key} className={x.available===null?'warn':''}><td>{fmt(x.night)}</td><td>{x.hotelName}</td><td>{x.roomName}</td><td>{x.available??<span className="notice">missing in Redis</span>}</td><td>{x.totalRooms??'—'}</td><td><code className="key">{x.key}</code></td></tr>)}
-      {data.items.length===0&&<tr><td colSpan={6}>No rooms match.</td></tr>}
+    <small>Redis stores only booked nights: a night with nothing booked has no entry, which means every room is free.</small>
+    <div className="tablewrap"><table><thead><tr><th>Night</th><th>Hotel</th><th>Room</th><th>Booked</th><th>Available</th><th>Total rooms</th><th>Redis key · field</th></tr></thead><tbody>
+      {data.items.map((x:any)=><tr key={x.key} className={x.available===0?'warn':''}><td>{fmt(x.night)}</td><td>{x.hotelName}</td><td>{x.roomName}</td><td>{x.stored?x.booked:<small>— (no entry)</small>}</td><td>{x.available}</td><td>{x.totalRooms}</td><td><code className="key">{x.key}</code></td></tr>)}
+      {data.items.length===0&&<tr><td colSpan={7}>No rooms match.</td></tr>}
     </tbody></table></div>
     <div className="row between"><small>{data.total.toLocaleString()} room-nights · page {page} of {pages}</small>
       <span className="row"><button disabled={page<=1} onClick={()=>setPage(page-1)}>Previous</button><button disabled={page>=pages} onClick={()=>setPage(page+1)}>Next</button></span></div>
@@ -358,26 +359,29 @@ const LOAD_SELLERS=[1000,10000,100000,1000000], LOAD_HOTELS=[1,10,100];
 const LOAD_STATUS:Record<string,string>={RUNNING:'Running…',DONE:'✓ Done',REDIS_FULL:'✕ Redis full',STOPPED:'Stopped',FAILED:'✕ Failed'};
 /** Admin: fills Redis with generated sellers/hotels until done or Redis reaches its maxmemory, then removes them. */
 function LoadTestPanel({onMessage,onChange}:{onMessage:(m:string)=>void,onChange:()=>void}){
-  const [sellers,setSellers]=useState(1000); const [perSeller,setPerSeller]=useState(1);
+  const [sellers,setSellers]=useState(1000); const [perSeller,setPerSeller]=useState(1); const [occupancy,setOccupancy]=useState(10);
   const [d,setD]=useState<any>(null);
   async function load(){try{setD(await api('/admin/load-test'))}catch(e:any){onMessage(e.message)}}
   const running=d?.job?.status==='RUNNING';
   useEffect(()=>{load()},[]);
   useEffect(()=>{if(!running)return;const t=setInterval(load,1000);return()=>{clearInterval(t);onChange()}},[running]);
   async function call(path:string,method:string,body?:any){try{await api(path,{method,...(body?{body:JSON.stringify(body)}:{})});load()}catch(e:any){onMessage(e.message)}}
-  const planned=sellers*perSeller*3*365, m=d?.redis.memory, j=d?.job;
-  // ~100 bytes per availability key, measured on this setup (key ~60 chars + Redis bookkeeping).
-  const estBytes=planned*100, fits=!m?.maxBytes||m.usedBytes+estBytes<=m.maxBytes;
+  const rooms=sellers*perSeller*3, m=d?.redis.memory, j=d?.job;
+  // Estimate: ~150 bytes per room-month key (13 months) + ~8 bytes per booked night; a night has an entry when at least
+  // one of the room type's ~4 units is booked (probability ~ 4 x occupancy, capped at 1).
+  const nightsWithEntry=rooms*365*Math.min(1,4*occupancy/100), keys=occupancy?rooms*13:0;
+  const estBytes=keys*150+nightsWithEntry*8, fits=!m?.maxBytes||m.usedBytes+estBytes<=m.maxBytes;
   const pct=(a:number,b:number)=>b?Math.min(100,a/b*100):0;
   return <><h3>Redis capacity test</h3>
     <div className="row">
       <label>Sellers<select value={sellers} onChange={e=>setSellers(Number(e.target.value))} disabled={running}>{LOAD_SELLERS.map(n=><option key={n} value={n}>{n.toLocaleString()}</option>)}</select></label>
       <label>Hotels per seller<select value={perSeller} onChange={e=>setPerSeller(Number(e.target.value))} disabled={running}>{LOAD_HOTELS.map(n=><option key={n} value={n}>{n}</option>)}</select></label>
-      <button onClick={()=>call('/admin/load-test','POST',{sellers,hotelsPerSeller:perSeller})} disabled={running}>Add sellers</button>
+      <label>Booked (occupancy)<select value={occupancy} onChange={e=>setOccupancy(Number(e.target.value))} disabled={running}>{[0,10,50,90].map(n=><option key={n} value={n}>{n}% of room-nights</option>)}</select></label>
+      <button onClick={()=>call('/admin/load-test','POST',{sellers,hotelsPerSeller:perSeller,occupancy})} disabled={running}>Add sellers</button>
       {running&&<button onClick={()=>call('/admin/load-test/stop','POST')}>Stop</button>}
       <button className="danger" onClick={()=>{if(confirm('Remove all capacity-test sellers, hotels and their Redis keys?'))call('/admin/load-test','DELETE')}} disabled={running||!d?.totals.rooms}>Remove capacity-test data</button>
     </div>
-    <small>Plan: {(sellers*perSeller).toLocaleString()} hotels × 3 room types × 365 nights = <b>{planned.toLocaleString()} Redis keys</b>, about {bytes(estBytes)}.
+    <small>Plan: {(sellers*perSeller).toLocaleString()} hotels ({rooms.toLocaleString()} room types){occupancy?<>, {occupancy}% of the next 365 nights booked: about <b>{keys.toLocaleString()} Redis keys, {bytes(estBytes)}</b></>:<>, nothing booked: <b>no Redis memory</b></>}.
       {!fits&&<span className="notice"> More than the Redis limit ({m&&bytes(m.maxBytes)}): it will run until Redis is full, then stop.</span>}</small>
     {d&&<div className="tiles">
       <div className="tile"><div className="tile-label">Redis RAM</div><div className="tile-value small">{bytes(m.usedBytes)}</div>
@@ -385,11 +389,11 @@ function LoadTestPanel({onMessage,onChange}:{onMessage:(m:string)=>void,onChange
       <div className="tile"><div className="tile-label">Keys in Redis</div><div className="tile-value small">{d.redis.keys.toLocaleString()}</div><div className="tile-hint">{d.redis.keys?`${Math.round(m.usedBytes/d.redis.keys)} bytes per key`:'empty'}</div></div>
       <div className="tile"><div className="tile-label">Test data in PostgreSQL</div><div className="tile-value small">{d.totals.hotels.toLocaleString()} hotels</div><div className="tile-hint">{d.totals.sellers.toLocaleString()} sellers · {d.totals.rooms.toLocaleString()} rooms · DB {bytes(d.totals.postgresBytes)}</div></div>
       {j&&<div className="tile"><div className="tile-label">{j.kind==='generate'?'Last run':'Last removal'}</div><div className={`tile-value small ${j.status==='DONE'?'ok':j.status==='RUNNING'?'':'bad'}`}>{LOAD_STATUS[j.status]}</div>
-        <div className="meter"><div style={{width:`${pct(j.done.keys,j.planned.keys)}%`}}/></div>
-        <div className="tile-hint">{j.done.keys.toLocaleString()} of {j.planned.keys.toLocaleString()} keys · {(j.elapsedMs/1000).toFixed(0)}s{j.elapsedMs>1000&&j.done.keys?` · ${Math.round(j.done.keys/(j.elapsedMs/1000)).toLocaleString()} keys/s`:''}</div></div>}
+        <div className="meter"><div style={{width:`${pct(j.kind==='generate'?j.done.hotels:j.done.rooms,j.kind==='generate'?j.planned.hotels:j.planned.rooms)}%`}}/></div>
+        <div className="tile-hint">{j.kind==='generate'?<>{j.done.hotels.toLocaleString()} of {j.planned.hotels.toLocaleString()} hotels · {j.occupancy}% booked · {j.done.keys.toLocaleString()} keys</>:<>{j.done.rooms.toLocaleString()} of {j.planned.rooms.toLocaleString()} rooms</>} · {(j.elapsedMs/1000).toFixed(0)}s</div></div>}
     </div>}
     {j&&j.status!=='RUNNING'&&<p className={j.status==='DONE'?'':'notice'}>{j.message}</p>}
-    <small>Sellers are generated with 3 room types per hotel, all loaded into Redis for the whole 365-night window, in batches of 250 hotels. When Redis reaches its memory limit it refuses writes; the half-loaded batch is rolled back and the test stops, showing how much this Redis can hold. While Redis is full, new bookings fail too, because reserving a room is also a write. Capacity-test sellers are hidden from the login list.</small>
+    <small>Sellers are generated with 3 room types per hotel, in batches of 250 hotels. Redis stores only booked nights, so hotels alone cost no Redis memory. The occupancy option writes synthetic booked counts to Redis for the next 365 nights (Redis only, no booking rows, kept by the rebuild), to measure how memory grows with bookings. When Redis reaches its memory limit it refuses writes; the half-written batch is rolled back and the test stops. While Redis is full, new bookings fail too, because reserving a room is also a write.</small>
   </>;
 }
 
@@ -407,7 +411,7 @@ function AvailabilityLog({onMessage}:{onMessage:(m:string)=>void}){
   useEffect(()=>{load()},[]);
   return <section className="card admin">
     <div className="row between"><h2>Availability log</h2><button onClick={load}>Refresh</button></div>
-    <small>The availability worker runs at startup and just after every UTC midnight: it adds the night that enters the 365-night window and removes the night that left it (yesterday).</small>
+    <small>The availability worker runs at startup and just after every UTC midnight: it removes booked nights that are already past from Redis. Nothing is ever added by the worker; bookings write their own nights, and whole month keys also expire two days after their month ends.</small>
     {!rows?<p>Loading…</p>:rows.length===0?<p>No runs yet. Is the availability-worker service running?</p>:
     <div className="tablewrap"><table><thead><tr><th>Time</th><th>Trigger</th><th>Status</th><th>Window</th><th>Added</th><th>Removed</th><th>Duration</th></tr></thead><tbody>
       {rows.map(r=><tr key={r.id} className={r.status==='OK'?'':'warn'}>
@@ -521,7 +525,7 @@ function App(){
     <div className="tablewrap"><table className="services"><thead><tr><th>Service</th><th>Address</th><th>Used for</th></tr></thead><tbody>
       {SERVICES.map(sv=><tr key={sv.name}><td>{sv.name}</td><td>{sv.href?<a href={sv.value} target="_blank" rel="noreferrer">{sv.value}</a>:<code>{sv.value}</code>}</td><td><small>{sv.usedFor}</small></td></tr>)}
     </tbody></table></div>
-    <p><small>Peek at Redis: <code>podman exec -it hotel-booking-lab_redis_1 redis-cli KEYS 'availability:*'</code></small></p>
+    <p><small>Peek at Redis: <code>podman exec -it hotel-booking-lab_redis_1 redis-cli --scan --pattern {"'av:{*'"}</code> (one hash per room type and month with bookings; <code>HGETALL</code> one to see booked nights)</small></p>
     <p><small>Kafka topics to watch in Kafka UI: booking.created, booking.confirmed, booking.payment_timeout, booking.cancelled, room.availability.changed.</small></p>
   </div></main>;
 

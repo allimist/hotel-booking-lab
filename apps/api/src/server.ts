@@ -184,73 +184,91 @@ function parseWeekdays(pct: any, allowNull: boolean) {
   return { pct: out as (number|null)[] };
 }
 
-// ---- Redis availability (one counter per room per night) ---------------
-const nightKey = (roomId: string, night: string) => `availability:${roomId}:${night}`;
+// ---- Redis availability: booked counts only ------------------------------
+// Per room type and month Redis holds one small hash, av:{roomId}:YYYY-MM, with a field only for nights that have
+// bookings or payment holds (field = day of month, value = rooms booked). A missing field means nothing is booked, so
+// Redis memory grows with bookings, not with the size of the catalogue. Capacity (rooms.total_rooms) stays in
+// PostgreSQL and is passed to the scripts. Month keys expire two days after their month ends: past nights clean
+// themselves up. {roomId} is a hash tag: all months of a room map to the same Redis Cluster slot.
+// av:loaded is written by the rebuild. Without it (Redis restarted empty) the scripts refuse to run, instead of
+// mistaking "no data" for "everything free".
+const AV_LOADED = 'av:loaded';
+const monthKey = (roomId: string, month: string) => `av:{${roomId}}:${month}`;
+const dayField = (night: string) => String(Number(night.slice(8)));
+const monthsOf = (nights: string[]) => [...new Set(nights.map(n => n.slice(0, 7)))];
+const monthExpireAt = (month: string) => { const [y, m] = month.split('-').map(Number); return String(Math.floor(Date.UTC(y, m, 1) / 1000) + 2 * 86400); };
 
-const NOT_LOADED = { statusCode: 409, message: 'Availability for these dates is not loaded in Redis' };
+const NOT_LOADED = { statusCode: 409, message: 'Availability is not loaded in Redis yet (rebuild running); try again in a moment' };
 
-/** Reads availability for every night. Every night must already be in Redis; a missing key is an error. */
-async function availabilityFor(roomId: string, nights: string[]) {
-  const vals = await redis.mget(nights.map(n => nightKey(roomId, n)));
-  if (vals.some(v => v === null)) throw NOT_LOADED;
-  return Math.min(...vals.map(Number));
+/** Booked count per night for each room (in `nights` order), or null when Redis is not loaded. */
+async function bookedCounts(roomIds: string[], nights: string[]) {
+  const months = monthsOf(nights);
+  const pipe = redis.pipeline().exists(AV_LOADED);
+  for (const rid of roomIds) for (const m of months) pipe.hmget(monthKey(rid, m), ...nights.filter(n => n.startsWith(m)).map(dayField));
+  const res = await execOrThrow(pipe);
+  if (!Number(res[0][1])) return null;
+  const out = new Map<string, number[]>();
+  roomIds.forEach((rid, i) => out.set(rid, months.flatMap((_, j) => (res[1 + i * months.length + j][1] as (string | null)[]).map(v => Number(v || 0)))));
+  return out;
+}
+/** Rooms still free for every night of the stay. */
+async function availabilityFor(room: { id: string; total_rooms: number }, nights: string[]) {
+  const b = await bookedCounts([room.id], nights);
+  if (!b) throw NOT_LOADED;
+  return Math.max(0, room.total_rooms - Math.max(...b.get(room.id)!));
 }
 
-// All-or-nothing: only decrements when every night exists and still has stock.
-// -2 = a night is not in Redis, -1 = a night is sold out.
+// Both scripts: KEYS = [av:loaded, month keys...]; ARGV = total_rooms, number of nights, then per night
+// (index into KEYS, day field), then per month key its EXPIREAT. -2 = Redis not loaded.
+function stayScript(roomId: string, total: number, nights: string[]) {
+  const months = monthsOf(nights);
+  const keys = [AV_LOADED, ...months.map(m => monthKey(roomId, m))];
+  const argv = [String(total), String(nights.length), ...nights.flatMap(n => [String(months.indexOf(n.slice(0, 7)) + 2), dayField(n)]), ...months.map(monthExpireAt)];
+  return [keys.length, ...keys, ...argv] as const;
+}
+// All-or-nothing: if any night already has booked >= total_rooms, returns -1 and changes nothing;
+// otherwise adds 1 to every night and returns the rooms left on the fullest night.
 const RESERVE_LUA = `
-  for i=1,#KEYS do
-    local v=redis.call('GET',KEYS[i])
-    if not v then return -2 end
-    if tonumber(v) <= 0 then return -1 end
+  if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end
+  local total, n, most = tonumber(ARGV[1]), tonumber(ARGV[2]), 0
+  for i = 1, n do
+    local b = tonumber(redis.call('HGET', KEYS[tonumber(ARGV[1 + 2*i])], ARGV[2 + 2*i]) or '0')
+    if b >= total then return -1 end
+    if b > most then most = b end
   end
-  local min=nil
-  for i=1,#KEYS do
-    local r=redis.call('DECR',KEYS[i])
-    if min==nil or r<min then min=r end
-  end
-  return min
+  for i = 1, n do redis.call('HINCRBY', KEYS[tonumber(ARGV[1 + 2*i])], ARGV[2 + 2*i], 1) end
+  for j = 2, #KEYS do redis.call('EXPIREAT', KEYS[j], ARGV[2 + 2*n + j - 1]) end
+  return total - most - 1
 `;
-// Gives nights back, never exceeding the room's total inventory. All-or-nothing: -2 if any night is not in Redis.
+// Gives nights back: -1 per night, and a night that reaches 0 is removed (keeps the hash sparse; an empty hash disappears).
 const RELEASE_LUA = `
-  for i=1,#KEYS do
-    if redis.call('EXISTS',KEYS[i])==0 then return -2 end
+  if redis.call('EXISTS', KEYS[1]) == 0 then return -2 end
+  local total, n, most = tonumber(ARGV[1]), tonumber(ARGV[2]), 0
+  for i = 1, n do
+    local k, f = KEYS[tonumber(ARGV[1 + 2*i])], ARGV[2 + 2*i]
+    local b = redis.call('HINCRBY', k, f, -1)
+    if b <= 0 then redis.call('HDEL', k, f) b = 0 end
+    if b > most then most = b end
   end
-  local min=nil
-  for i=1,#KEYS do
-    local r=math.min(tonumber(redis.call('GET',KEYS[i]))+1, tonumber(ARGV[1]))
-    redis.call('SET',KEYS[i],r)
-    if min==nil or r<min then min=r end
-  end
-  return min
+  return total - most
 `;
 
-/** Releases the not-yet-past nights of a stay (past nights are no longer kept in Redis). Returns remaining, or null if nothing to release. */
+/** Releases the not-yet-past nights of a stay (past nights no longer matter). Returns rooms left, or null if nothing to release. */
 async function releaseNights(roomId: string, totalRooms: number, checkIn: string, checkOut: string) {
-  const today = todayStr();
-  const keys = nightsOf(checkIn, checkOut).filter(n => n >= today).map(n => nightKey(roomId, n));
-  if (!keys.length) return null;
-  const remaining = Number(await redis.eval(RELEASE_LUA, keys.length, ...keys, String(totalRooms)));
+  const nights = nightsOf(checkIn, checkOut).filter(n => n >= todayStr());
+  if (!nights.length) return null;
+  const remaining = Number(await redis.eval(RELEASE_LUA, ...stayScript(roomId, totalRooms, nights)));
   if (remaining === -2) throw NOT_LOADED;
   return remaining;
 }
 
-/** Loads a fresh room's availability (total_rooms per night) for the whole booking horizon. Never overwrites existing keys. */
-async function seedRoomAvailability(rooms: { id: string; total_rooms: number }[]) {
-  const today = todayStr();
-  const pipe = redis.pipeline();
-  for (const r of rooms)
-    for (let i = 0; i < AVAILABILITY_DAYS; i++) pipe.set(nightKey(r.id, addDays(today, i)), String(r.total_rooms), 'NX');
-  await pipe.exec();
-}
-
-/** Every key a room can have: yesterday (until the worker rolls it out) .. one night past the window. */
-function roomKeys(roomId: string) {
-  const first = addDays(todayStr(), -1);
-  return Array.from({ length: AVAILABILITY_DAYS + 2 }, (_, i) => nightKey(roomId, addDays(first, i)));
+/** Every month key a room can have: last month .. the end of the booking window. */
+function roomMonthKeys(roomId: string) {
+  const first = addDays(todayStr(), -31);
+  return monthsOf(Array.from({ length: AVAILABILITY_DAYS + 33 }, (_, i) => addDays(first, i))).map(m => monthKey(roomId, m));
 }
 async function deleteRoomAvailability(roomId: string) {
-  await redis.unlink(...roomKeys(roomId));
+  await redis.unlink(...roomMonthKeys(roomId));
 }
 
 /** Runs a pipeline and throws its first command error (ioredis reports those per command instead of rejecting). */
@@ -259,12 +277,6 @@ async function execOrThrow(pipe: ReturnType<typeof redis.pipeline>) {
   const failed = res?.find(([err]) => err);
   if (failed) throw failed[0];
   return res!;
-}
-/** SETs key/value pairs in MSET chunks. */
-async function msetAll(pairs: string[]) {
-  const pipe = redis.pipeline();
-  for (let i = 0; i < pairs.length; i += 2000) pipe.mset(...pairs.slice(i, i + 2000));
-  await execOrThrow(pipe);
 }
 const isRedisOom = (e: any) => String(e?.message || e).startsWith('OOM');
 
@@ -359,15 +371,14 @@ app.get('/api/hotels', async (req: any) => {
     for (const h of rows) if (pageStays.has(h.id)) {
       h.startingTotal = pageStays.get(h.id); h.startingPrice = Math.round(h.startingTotal / nights.length); h.priceForDates = true;
     }
-    const rooms = await pool.query(`SELECT id, hotel_id FROM rooms WHERE hotel_id = ANY($1)`, [rows.map((h:any) => h.id)]);
-    const vals = rooms.rows.length ? await redis.mget(rooms.rows.flatMap((rm:any) => nights.map(n => nightKey(rm.id, n)))) : [];
+    const rooms = (await pool.query(`SELECT id, hotel_id, total_rooms FROM rooms WHERE hotel_id = ANY($1)`, [rows.map((h:any) => h.id)])).rows;
+    const booked = await bookedCounts(rooms.map((rm:any) => rm.id), nights);
     const free = new Map<string, number | null>();
-    rooms.rows.forEach((rm:any, i:number) => {
-      const v = vals.slice(i * nights.length, (i + 1) * nights.length);
-      const roomFree = v.some(x => x === null) ? null : Math.min(...v.map(Number));
+    for (const rm of rooms) {
+      const roomFree = booked ? Math.max(0, rm.total_rooms - Math.max(...booked.get(rm.id)!)) : null;
       const prev = free.has(rm.hotel_id) ? free.get(rm.hotel_id)! : 0;
-      free.set(rm.hotel_id, prev === null || roomFree === null ? null : prev + Math.max(0, roomFree));
-    });
+      free.set(rm.hotel_id, prev === null || roomFree === null ? null : prev + roomFree);
+    }
     for (const h of rows) { const f = free.has(h.id) ? free.get(h.id)! : 0; h.availableRooms = f; h.soldOut = f === null ? null : f === 0; }
   }
   return { page, limit, total, priceSortApprox, items: rows };
@@ -386,9 +397,11 @@ app.get('/api/hotels/:id', async (req:any, reply) => {
   const rooms = await pool.query(`SELECT * FROM rooms WHERE hotel_id=$1 ORDER BY price`, [req.params.id]);
   const photos = await pool.query(`SELECT * FROM hotel_photos WHERE hotel_id=$1`, [req.params.id]);
   const rules = await loadPricing([req.params.id]);
+  const booked = await bookedCounts(rooms.rows.map((room:any) => room.id), range.nights);
+  if (!booked) return reply.code(409).send({ error: NOT_LOADED.message });
   const enriched = [];
   for (const room of rooms.rows) {
-    const availableRooms = await availabilityFor(room.id, range.nights);
+    const availableRooms = Math.max(0, room.total_rooms - Math.max(...booked.get(room.id)!));
     const quote = priceStay(room, range.nights, rules);
     enriched.push({ ...room, availableRooms, nights: range.nights.length, nightly: quote.nightly, totalPrice: quote.total,
       avgNightly: Math.round(quote.total / range.nights.length) });
@@ -401,9 +414,8 @@ app.get('/api/hotels/:id', async (req:any, reply) => {
 async function createBooking(userId: string, r: any, checkIn: string, checkOut: string, nights: string[], status: 'PENDING'|'CONFIRMED' = 'PENDING', windowSeconds = PAYMENT_WINDOW_SECONDS) {
   // Priced before the Redis reserve, so a pricing failure never leaves a lock behind. The booking keeps this price.
   const quote = priceStay(r, nights, await loadPricing([r.hotel_id]));
-  const keys = nights.map(n => nightKey(r.id, n));
   const t0 = performance.now();
-  const remaining = Number(await redis.eval(RESERVE_LUA, keys.length, ...keys, String(r.total_rooms)));
+  const remaining = Number(await redis.eval(RESERVE_LUA, ...stayScript(r.id, r.total_rooms, nights)));
   const redisMs = performance.now() - t0;
   if (remaining === -2) throw { ...NOT_LOADED, redisMs };
   if (remaining < 0) throw { statusCode: 409, message: 'No rooms available for the selected dates', redisMs };
@@ -412,6 +424,15 @@ async function createBooking(userId: string, r: any, checkIn: string, checkOut: 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Final guard, PostgreSQL decides: lock the room type and count the active bookings on each night. Redis turns
+    // away almost every sold-out request before this point; if Redis is ever wrong (writes lost in a failover, a
+    // rebuild racing a booking) this turns what would be an overbooking into a clean "sold out".
+    await client.query(`SELECT 1 FROM rooms WHERE id=$1 FOR UPDATE`, [r.id]);
+    const full = await client.query(`
+      SELECT count(*)::int AS n FROM unnest($2::date[]) AS d(night)
+      WHERE (SELECT count(*) FROM bookings b WHERE b.room_id=$1 AND b.status IN ('CONFIRMED','PENDING')
+             AND b.check_in <= d.night AND b.check_out > d.night) >= $3`, [r.id, nights, r.total_rooms]);
+    if (full.rows[0].n) throw { statusCode: 409, message: 'No rooms available for the selected dates', guard: true, redisMs };
     const bookingId=id();
     // PENDING = room locked while the customer pays; the expiry worker releases it if they don't.
     const ins = await client.query(
@@ -764,7 +785,6 @@ app.post('/api/admin/sample-data', async (req:any) => {
     }
     const existing = await client.query(`SELECT count(*)::int AS n FROM hotels WHERE is_sample=true`);
     let hotelsCreated = 0;
-    const newRooms: { id: string; total_rooms: number }[] = [];
     if (existing.rows[0].n > 0) {
       // Databases seeded before seller2 existed: hand even-numbered sample hotels to seller2.
       await client.query(`UPDATE hotels SET seller_id=$1 WHERE is_sample=true AND seller_id=$2 AND (regexp_replace(name,'\\D','','g'))::int % 2 = 0`,
@@ -781,14 +801,11 @@ app.post('/api/admin/sample-data', async (req:any) => {
           const room = { id: id(), total_rooms: 3+j };
           await client.query(`INSERT INTO rooms(id,hotel_id,name,price,total_rooms,is_sample) VALUES($1,$2,$3,$4,$5,true)`,
             [room.id,hid,`Room Type ${j}`,1000+i*50+j*100,room.total_rooms]);
-          newRooms.push(room);
         }
         hotelsCreated++;
       }
     }
     await client.query('COMMIT');
-    // Every room's availability must be in Redis before it can be booked.
-    await seedRoomAvailability(newRooms);
     await ensureSamplePriceRules();
     return {ok:true,
       message: hotelsCreated ? `Sample data generated (${hotelsCreated} hotels, 4 users)` : 'Sample users ensured; sample hotels already existed',
@@ -1119,7 +1136,7 @@ app.post('/api/admin/concurrent-booking', async (req:any, reply) => {
   const r = room.rows[0];
   const customers = await pool.query(`SELECT id,name,email FROM users WHERE role='CUSTOMER' ORDER BY created_at`);
   if (!customers.rows.length) return reply.code(409).send({ error: 'No customers exist yet' });
-  const before = await availabilityFor(r.id, range.nights);
+  const before = await availabilityFor(r, range.nights);
   const startedAt = Date.now();
   const settled = await Promise.allSettled(customers.rows.map((c:any) =>
     createBooking(c.id, r, checkIn, checkOut, range.nights, confirm ? 'CONFIRMED' : 'PENDING')));
@@ -1131,7 +1148,7 @@ app.post('/api/admin/concurrent-booking', async (req:any, reply) => {
     if (e?.statusCode !== 409) app.log.error(e);
     return { customer: c.name, email: c.email, ok: false, error: e?.statusCode === 409 ? e.message : 'Internal error' };
   });
-  const after = await availabilityFor(r.id, range.nights);
+  const after = await availabilityFor(r, range.nights);
   const won = results.filter(x => x.ok).length;
   await pool.query(`INSERT INTO audit_logs(id,actor_user_id,action,metadata) VALUES($1,$2,'CONCURRENT_BOOKING_DEMO',$3)`,
     [id(), req.userCtx!.id, JSON.stringify({ roomId, checkIn, checkOut, customers: customers.rows.length, won, before, after, confirm: !!confirm })]);
@@ -1196,49 +1213,62 @@ async function expiryLoop() {
   }
 }
 
-// Redis is a cache of PostgreSQL truth: write every room's availability for every night of the
-// booking horizon (today .. today+AVAILABILITY_DAYS-1). Bookings fail if a night is missing, so all must be loaded.
-// Run at startup (Redis may have restarted empty) and on demand from the admin panel.
+// Redis is a cache of PostgreSQL truth: write the booked count of every night that has active bookings, drop what no
+// booking backs any more, then mark Redis as loaded. Work grows with bookings, not with the catalogue.
+// Runs at startup (Redis may have restarted empty) and on demand from the admin panel.
 async function rebuildAvailability() {
   const t0 = performance.now();
-  const first = todayStr(), last = addDays(first, AVAILABILITY_DAYS - 1);
-  const roomIds = new Set<string>();
-  let roomNights = 0, oversold = 0, after = '00000000-0000-0000-0000-000000000000';
-  // 200 rooms (73k room-nights) per query, so a large catalogue (Redis capacity test) never has to fit in memory at once.
-  while (true) {
-    const r = await pool.query(`
-      WITH rs AS (SELECT id, total_rooms FROM rooms WHERE id > $3 ORDER BY id LIMIT 200)
-      SELECT rs.id AS room_id, rs.total_rooms, to_char(d.night,'YYYY-MM-DD') AS night, count(b.id)::int AS booked
-      FROM rs
-      CROSS JOIN generate_series($1::date, $2::date, '1 day') AS d(night)
-      LEFT JOIN bookings b ON b.room_id=rs.id AND b.status IN ('CONFIRMED','PENDING') AND b.check_in <= d.night AND b.check_out > d.night
-      GROUP BY rs.id, rs.total_rooms, d.night`, [first, last, after]);
-    if (!r.rows.length) break;
-    const pairs: string[] = [];
-    for (const row of r.rows) {
-      roomIds.add(row.room_id);
-      if (row.room_id > after) after = row.room_id;
-      if (row.booked > row.total_rooms) oversold++;
-      pairs.push(nightKey(row.room_id, row.night), String(Math.max(0, row.total_rooms - row.booked)));
-    }
-    // Plain SETs (no deletes) so a concurrent booking never sees one of its nights missing mid-rebuild.
-    await msetAll(pairs);
-    roomNights += r.rows.length;
+  const first = todayStr(), end = addDays(first, AVAILABILITY_DAYS);
+  const r = await pool.query(`
+    SELECT b.room_id, to_char(d, 'YYYY-MM-DD') AS night, count(*)::int AS booked
+    FROM bookings b CROSS JOIN LATERAL generate_series(GREATEST(b.check_in, $1::date), LEAST(b.check_out, $2::date) - 1, '1 day') AS d
+    WHERE b.status IN ('CONFIRMED','PENDING') AND b.check_out > $1::date AND b.check_in < $2::date
+    GROUP BY 1, 2`, [first, end]);
+  const wanted = new Map<string, Record<string, string>>();
+  for (const row of r.rows) {
+    const k = monthKey(row.room_id, row.night.slice(0, 7));
+    wanted.set(k, { ...wanted.get(k), [dayField(row.night)]: String(row.booked) });
   }
-  // Stale keys: past nights and deleted rooms.
-  let staleKeysDropped = 0;
+  // HSET only overwrites, so a booking running right now never sees one of its nights disappear.
+  let pipe = redis.pipeline(), queued = 0;
+  for (const [k, fields] of wanted) {
+    pipe.hset(k, fields).expireat(k, monthExpireAt(k.slice(-7)));
+    if (++queued % 2000 === 0) { await execOrThrow(pipe); pipe = redis.pipeline(); }
+  }
+  await execOrThrow(pipe);
+  // Stale: nights no active booking backs any more, and keys of deleted rooms. Capacity-test rooms keep their
+  // synthetic occupancy, which exists only in Redis.
+  let staleFieldsDropped = 0, staleKeysDropped = 0;
+  for await (const keys of redis.scanStream({ match: 'av:{*', count: 1000 }) as AsyncIterable<string[]>) {
+    if (!keys.length) continue;
+    const roomIds = [...new Set(keys.map(k => k.slice(4, 40)))];
+    const rooms = new Map((await pool.query(`SELECT id, is_load_test FROM rooms WHERE id = ANY($1)`, [roomIds])).rows.map((x:any) => [x.id, x.is_load_test]));
+    const gone = keys.filter(k => !rooms.has(k.slice(4, 40)));
+    if (gone.length) { await redis.unlink(...gone); staleKeysDropped += gone.length; }
+    const check = keys.filter(k => rooms.get(k.slice(4, 40)) === false);
+    if (!check.length) continue;
+    const fields = await execOrThrow(check.reduce((p, k) => p.hkeys(k), redis.pipeline()));
+    const del = redis.pipeline();
+    check.forEach((k, i) => {
+      const extra = (fields[i][1] as string[]).filter(f => !wanted.get(k)?.[f]);
+      if (extra.length) { del.hdel(k, ...extra); staleFieldsDropped += extra.length; }
+    });
+    await execOrThrow(del);
+  }
+  // Keys of the old format (one counter per room per night), from before booked counts.
   for await (const keys of redis.scanStream({ match: 'availability:*', count: 1000 }) as AsyncIterable<string[]>) {
-    const stale = keys.filter(k => { const night = k.slice(-10); return night < first || night > last || !roomIds.has(k.slice('availability:'.length, -11)); });
-    if (stale.length) { await redis.unlink(...stale); staleKeysDropped += stale.length; }
+    if (keys.length) { await redis.unlink(...keys); staleKeysDropped += keys.length; }
   }
-  const summary = { roomNights, staleKeysDropped, oversoldRoomNights: oversold, ms: Math.round(performance.now() - t0) };
+  await redis.set(AV_LOADED, new Date().toISOString());
+  const summary = { bookedRoomNights: r.rows.reduce((a: number, x: any) => a + x.booked, 0), nights: r.rows.length, keys: wanted.size,
+    staleFieldsDropped, staleKeysDropped, ms: Math.round(performance.now() - t0) };
   app.log.info(summary, 'availability rebuilt from PostgreSQL');
   return summary;
 }
 app.post('/api/admin/rebuild-availability', async (req:any) => {
   await auth(req,['ADMIN']);
   const summary = await rebuildAvailability();
-  return { ok: true, ...summary, message: `Redis availability rebuilt: ${summary.roomNights} room-nights set, ${summary.staleKeysDropped} stale keys dropped${summary.oversoldRoomNights?`, ${summary.oversoldRoomNights} oversold`:''}` };
+  return { ok: true, ...summary, message: `Redis rebuilt from PostgreSQL in ${summary.ms} ms: ${summary.bookedRoomNights} booked room-nights on ${summary.nights} room-nights in ${summary.keys} keys; ${summary.staleFieldsDropped} stale nights and ${summary.staleKeysDropped} stale keys dropped` };
 });
 
 // RAM used by the whole Redis instance (all keys, not just availability:*), from INFO memory.
@@ -1247,61 +1277,47 @@ async function redisMemory() {
   return { usedBytes: Number(info.used_memory), peakBytes: Number(info.used_memory_peak), datasetBytes: Number(info.used_memory_dataset), maxBytes: Number(info.maxmemory) || 0 };
 }
 
-/** How many of these keys exist, via pipelined multi-key EXISTS. */
-async function countExisting(keys: string[]) {
-  const pipe = redis.pipeline();
-  for (let i = 0; i < keys.length; i += 1000) pipe.exists(...keys.slice(i, i + 1000));
-  return (await execOrThrow(pipe)).reduce((n, [, v]) => n + Number(v), 0);
-}
-
-// Availability grid (every room x every night of the window) with the value Redis holds for each cell. Filter by hotel
-// and/or night; paged. Built from PostgreSQL rooms + computed keys instead of scanning Redis, so it stays fast with millions of keys.
+// Every room x every night of the booking window with its booked count in Redis (filter by hotel and/or night; paged),
+// plus a consistency check: Redis booked counts vs active bookings in PostgreSQL for every booked night (sample rooms).
 app.get('/api/admin/redis-records', async (req:any) => {
   await auth(req,['ADMIN']);
   const { hotelId, night } = req.query;
   const page = Math.max(1, Number(req.query.page) || 1), limit = Math.min(500, Math.max(1, Number(req.query.limit) || 50));
-  const first = todayStr(), last = addDays(first, AVAILABILITY_DAYS - 1);
+  const first = todayStr(), end = addDays(first, AVAILABILITY_DAYS);
   const allRooms = (await pool.query(`SELECT r.id, r.name, r.total_rooms, h.id AS hotel_id, h.name AS hotel_name FROM rooms r JOIN hotels h ON h.id=r.hotel_id ORDER BY h.name, r.name, r.id`)).rows;
-  // Window edges: every room should have today and the last night, and nothing for yesterday or the night after the window.
-  const ids = allRooms.map((r:any) => r.id);
-  const [hasFirst, hasLast, beforeFirst, afterLast] = await Promise.all(
-    [first, last, addDays(first, -1), addDays(last, 1)].map(n => countExisting(ids.map((i:string) => nightKey(i, n)))));
-  const totalKeys = await redis.dbsize(); // every key in this Redis is an availability key
-  const expectedKeys = allRooms.length * AVAILABILITY_DAYS;
-  const problems = [
-    totalKeys !== expectedKeys && `${(totalKeys - expectedKeys).toLocaleString('en')} keys vs expected`,
-    hasFirst < ids.length && `${ids.length - hasFirst} rooms missing today`,
-    hasLast < ids.length && `${ids.length - hasLast} rooms missing the last night`,
-    beforeFirst && `${beforeFirst} keys for yesterday`,
-    afterLast && `${afterLast} keys past the window`,
-  ].filter(Boolean);
+  const pg = (await pool.query(`
+    SELECT b.room_id, to_char(d, 'YYYY-MM-DD') AS night, count(*)::int AS booked
+    FROM bookings b JOIN rooms r ON r.id=b.room_id AND NOT r.is_load_test
+    CROSS JOIN LATERAL generate_series(GREATEST(b.check_in, $1::date), LEAST(b.check_out, $2::date) - 1, '1 day') AS d
+    WHERE b.status IN ('CONFIRMED','PENDING') AND b.check_out > $1::date AND b.check_in < $2::date
+    GROUP BY 1, 2 LIMIT 50000`, [first, end])).rows;
+  const redisVals = pg.length ? await execOrThrow(pg.reduce((p, x:any) => p.hget(monthKey(x.room_id, x.night.slice(0, 7)), dayField(x.night)), redis.pipeline())) : [];
+  const mismatches = pg.filter((x:any, i) => Number(redisVals[i][1] || 0) !== x.booked).length;
   const summary = {
-    totalKeys, rooms: allRooms.length, windowDays: AVAILABILITY_DAYS, expectedKeys,
-    firstNight: beforeFirst ? addDays(first, -1) : hasFirst ? first : null, lastNight: afterLast ? addDays(last, 1) : hasLast ? last : null,
-    expectedFirstNight: first, expectedLastNight: last,
-    windowOk: problems.length === 0, windowHint: problems.length ? problems.join(' · ') : 'every room has every night',
-    memory: await redisMemory(),
+    totalKeys: await redis.dbsize(), rooms: allRooms.length, windowDays: AVAILABILITY_DAYS, memory: await redisMemory(),
+    loadedAt: await redis.get(AV_LOADED),
+    checkedRoomNights: pg.length, bookedRoomNights: pg.reduce((a: number, x: any) => a + x.booked, 0), mismatches,
   };
   const rooms = hotelId ? allRooms.filter((r:any) => r.hotel_id === hotelId) : allRooms;
   const nights = night ? [String(night)] : Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(first, i));
   const total = rooms.length * nights.length;
   // Row i = night i / rooms, room i % rooms (sorted by night, then hotel, then room).
   const slice = [];
-  for (let i = (page - 1) * limit; i < Math.min(total, page * limit); i++) {
-    const room = rooms[i % rooms.length], n = nights[Math.floor(i / rooms.length)];
-    slice.push({ key: nightKey(room.id, n), night: n, room });
-  }
-  const vals = slice.length ? await redis.mget(slice.map(x => x.key)) : [];
+  for (let i = (page - 1) * limit; i < Math.min(total, page * limit); i++) slice.push({ night: nights[Math.floor(i / rooms.length)], room: rooms[i % rooms.length] });
+  const vals = slice.length ? await execOrThrow(slice.reduce((p, x) => p.hget(monthKey(x.room.id, x.night.slice(0, 7)), dayField(x.night)), redis.pipeline())) : [];
   return { summary, page, limit, total,
-    items: slice.map((x, i) => ({ key: x.key, night: x.night, available: vals[i] === null ? null : Number(vals[i]),
-      roomId: x.room.id, roomName: x.room.name, hotelName: x.room.hotel_name, totalRooms: x.room.total_rooms })) };
+    items: slice.map((x, i) => { const booked = Number(vals[i][1] || 0);
+      return { key: `${monthKey(x.room.id, x.night.slice(0, 7))} · ${dayField(x.night)}`, stored: vals[i][1] !== null, night: x.night, booked,
+        available: Math.max(0, x.room.total_rooms - booked), roomId: x.room.id, roomName: x.room.name, hotelName: x.room.hotel_name, totalRooms: x.room.total_rooms }; }) };
 });
 
 // ---- Redis capacity test ---------------------------------------------------
-// Creates sellers x hotels-per-seller hotels (3 room types each) in PostgreSQL and loads every room-night into Redis,
-// batch by batch, until done, stopped, or Redis hits maxmemory (it then rejects writes with an OOM error).
-// Rows are flagged is_load_test so they can be removed without touching sample or real data. One job at a time.
-const LOAD_BATCH_HOTELS = 250; // 750 rooms, ~274k Redis keys per batch
+// Creates sellers x hotels-per-seller hotels (3 room types each) in PostgreSQL, batch by batch. With occupancy > 0 it
+// also writes synthetic booked counts to Redis for every night of the window (Redis only, no booking rows), to
+// measure how Redis memory grows with bookings; it stops when done, stopped, or Redis hits maxmemory (it then
+// rejects writes with an OOM error). Rows are flagged is_load_test so they can be removed without touching sample
+// or real data. One job at a time.
+const LOAD_BATCH_HOTELS = 250; // 750 rooms per batch
 const LOAD_LOCATIONS: [string, string][] = [
   ['Thailand', 'Bangkok'], ['Thailand', 'Chiang Mai'], ['Thailand', 'Phuket'], ['Thailand', 'Pattaya'], ['Thailand', 'Krabi'],
   ['Japan', 'Tokyo'], ['Japan', 'Osaka'], ['Japan', 'Kyoto'],
@@ -1312,9 +1328,9 @@ const LOAD_LOCATIONS: [string, string][] = [
 ];
 type LoadJob = {
   kind: 'generate' | 'remove'; status: 'RUNNING' | 'DONE' | 'REDIS_FULL' | 'STOPPED' | 'FAILED';
-  sellers: number; hotelsPerSeller: number;
+  sellers: number; hotelsPerSeller: number; occupancy: number;
   planned: { sellers: number; hotels: number; rooms: number; keys: number };
-  done: { sellers: number; hotels: number; rooms: number; keys: number };
+  done: { sellers: number; hotels: number; rooms: number; keys: number; bookedNights: number };
   startedAt: number; finishedAt?: number; message: string; stop?: boolean;
 };
 let loadJob: LoadJob | null = null;
@@ -1331,7 +1347,9 @@ async function loadTestTotals() {
 async function runLoadGenerate(job: LoadJob) {
   const tag = id().slice(0, 6); // keeps emails unique across runs
   const first = todayStr();
-  const nights = Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(first, i));
+  const nights = Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(first, i)), months = monthsOf(nights);
+  // Rooms booked on one night: occupancy % of the room type's units, rounded up or down at random.
+  const synth = (units: number) => { const x = units * job.occupancy / 100; return Math.floor(x) + (Math.random() < x - Math.floor(x) ? 1 : 0); };
   let seller = 0, hotelOfSeller = 0, sellerId = '';
   while (seller < job.sellers && !job.stop) {
     // Next batch of hotels, creating sellers as they come up.
@@ -1363,25 +1381,34 @@ async function runLoadGenerate(job: LoadJob) {
         [rooms.map(r => r.id), rooms.map(r => r.hotel), rooms.map(r => r.name), rooms.map(r => r.price), rooms.map(r => r.total)]);
       await client.query('COMMIT');
     } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
-    const pairs: string[] = [];
-    for (const r of rooms) for (const n of nights) pairs.push(nightKey(r.id, n), String(r.total));
-    try {
-      await msetAll(pairs);
-    } catch (e) {
-      if (!isRedisOom(e)) throw e;
-      // Redis is full: undo this half-loaded batch so every remaining room is fully bookable.
-      const keys = pairs.filter((_, i) => i % 2 === 0);
-      for (let i = 0; i < keys.length; i += 5000) await redis.unlink(...keys.slice(i, i + 5000));
-      await pool.query(`DELETE FROM hotels WHERE id = ANY($1)`, [hotels.map(h => h.id)]); // rooms + photos cascade
-      await pool.query(`DELETE FROM users u WHERE u.id = ANY($1) AND NOT EXISTS (SELECT 1 FROM hotels h WHERE h.seller_id=u.id)`, [users.map(u => u.id)]);
-      job.status = 'REDIS_FULL';
-      job.message = `Redis is full (maxmemory reached) after ${job.done.keys.toLocaleString('en')} keys from this run. The last, partly loaded batch was rolled back.`;
-      return;
+    const keys: string[] = [];
+    let bookedNights = 0;
+    if (job.occupancy) {
+      const pipe = redis.pipeline();
+      for (const r of rooms) for (const m of months) {
+        const fields: Record<string, string> = {};
+        for (const n of nights) if (n.startsWith(m)) { const b = synth(r.total); if (b) { fields[dayField(n)] = String(b); bookedNights++; } }
+        if (!Object.keys(fields).length) continue;
+        const k = monthKey(r.id, m); keys.push(k); pipe.hset(k, fields).expireat(k, monthExpireAt(m));
+      }
+      try {
+        await execOrThrow(pipe);
+      } catch (e) {
+        if (!isRedisOom(e)) throw e;
+        // Redis is full: undo this half-written batch.
+        for (let i = 0; i < keys.length; i += 5000) await redis.unlink(...keys.slice(i, i + 5000));
+        await pool.query(`DELETE FROM hotels WHERE id = ANY($1)`, [hotels.map(h => h.id)]); // rooms + photos cascade
+        await pool.query(`DELETE FROM users u WHERE u.id = ANY($1) AND NOT EXISTS (SELECT 1 FROM hotels h WHERE h.seller_id=u.id)`, [users.map(u => u.id)]);
+        job.status = 'REDIS_FULL';
+        job.message = `Redis is full (maxmemory reached) after ${job.done.hotels.toLocaleString('en')} hotels (${job.done.keys.toLocaleString('en')} keys) from this run. The last, partly written batch was rolled back.`;
+        return;
+      }
     }
-    job.done.sellers += users.length; job.done.hotels += hotels.length; job.done.rooms += rooms.length; job.done.keys += pairs.length / 2;
+    job.done.sellers += users.length; job.done.hotels += hotels.length; job.done.rooms += rooms.length; job.done.keys += keys.length; job.done.bookedNights += bookedNights;
   }
   job.status = job.stop ? 'STOPPED' : 'DONE';
-  job.message = `${job.stop ? 'Stopped' : 'Done'}: ${job.done.hotels.toLocaleString('en')} hotels, ${job.done.keys.toLocaleString('en')} Redis keys added.`;
+  job.message = `${job.stop ? 'Stopped' : 'Done'}: ${job.done.hotels.toLocaleString('en')} hotels` +
+    (job.occupancy ? `, ${job.done.bookedNights.toLocaleString('en')} room-nights with bookings in ${job.done.keys.toLocaleString('en')} Redis keys.` : '; no Redis memory used (nothing booked).');
 }
 
 async function runLoadRemove(job: LoadJob) {
@@ -1389,11 +1416,11 @@ async function runLoadRemove(job: LoadJob) {
   while (!job.stop) {
     const rooms = (await pool.query(`SELECT id FROM rooms WHERE is_load_test LIMIT 1000`)).rows.map((r:any) => r.id as string);
     if (!rooms.length) break;
-    const keys = rooms.flatMap(roomKeys);
+    const keys = rooms.flatMap(roomMonthKeys);
     for (let i = 0; i < keys.length; i += 5000) await redis.unlink(...keys.slice(i, i + 5000));
     await pool.query(`DELETE FROM bookings WHERE room_id = ANY($1)`, [rooms]);
     await pool.query(`DELETE FROM rooms WHERE id = ANY($1)`, [rooms]);
-    job.done.rooms += rooms.length; job.done.keys += rooms.length * AVAILABILITY_DAYS;
+    job.done.rooms += rooms.length;
   }
   if (!job.stop) {
     await pool.query(`DELETE FROM bookings WHERE hotel_id IN (SELECT id FROM hotels WHERE is_load_test)`);
@@ -1419,12 +1446,13 @@ app.get('/api/admin/load-test', async (req:any) => {
 app.post('/api/admin/load-test', async (req:any, reply) => {
   await auth(req,['ADMIN']);
   if (loadJob?.status === 'RUNNING') return reply.code(409).send({ error: 'A capacity test job is already running' });
-  const sellers = Number(req.body?.sellers), hotelsPerSeller = Number(req.body?.hotelsPerSeller);
-  if (![1000, 10000, 100000, 1000000].includes(sellers) || ![1, 10, 100].includes(hotelsPerSeller))
-    return reply.code(400).send({ error: 'sellers must be 1000/10000/100000/1000000 and hotelsPerSeller 1/10/100' });
+  const sellers = Number(req.body?.sellers), hotelsPerSeller = Number(req.body?.hotelsPerSeller), occupancy = Number(req.body?.occupancy ?? 0);
+  if (![1000, 10000, 100000, 1000000].includes(sellers) || ![1, 10, 100].includes(hotelsPerSeller) || ![0, 10, 50, 90].includes(occupancy))
+    return reply.code(400).send({ error: 'sellers must be 1000/10000/100000/1000000, hotelsPerSeller 1/10/100 and occupancy 0/10/50/90' });
   const hotels = sellers * hotelsPerSeller;
-  startLoadJob({ kind: 'generate', status: 'RUNNING', sellers, hotelsPerSeller, startedAt: Date.now(), message: 'Generating…',
-    planned: { sellers, hotels, rooms: hotels * 3, keys: hotels * 3 * AVAILABILITY_DAYS }, done: { sellers: 0, hotels: 0, rooms: 0, keys: 0 } }, runLoadGenerate);
+  const months = monthsOf(Array.from({ length: AVAILABILITY_DAYS }, (_, i) => addDays(todayStr(), i))).length;
+  startLoadJob({ kind: 'generate', status: 'RUNNING', sellers, hotelsPerSeller, occupancy, startedAt: Date.now(), message: 'Generating…',
+    planned: { sellers, hotels, rooms: hotels * 3, keys: occupancy ? hotels * 3 * months : 0 }, done: { sellers: 0, hotels: 0, rooms: 0, keys: 0, bookedNights: 0 } }, runLoadGenerate);
   return { ok: true };
 });
 app.post('/api/admin/load-test/stop', async (req:any) => {
@@ -1436,8 +1464,8 @@ app.delete('/api/admin/load-test', async (req:any, reply) => {
   await auth(req,['ADMIN']);
   if (loadJob?.status === 'RUNNING') return reply.code(409).send({ error: 'Stop the running job first' });
   const t = await loadTestTotals();
-  startLoadJob({ kind: 'remove', status: 'RUNNING', sellers: 0, hotelsPerSeller: 0, startedAt: Date.now(), message: 'Removing…',
-    planned: { sellers: t.sellers, hotels: t.hotels, rooms: t.rooms, keys: t.rooms * AVAILABILITY_DAYS }, done: { sellers: 0, hotels: 0, rooms: 0, keys: 0 } }, runLoadRemove);
+  startLoadJob({ kind: 'remove', status: 'RUNNING', sellers: 0, hotelsPerSeller: 0, occupancy: 0, startedAt: Date.now(), message: 'Removing…',
+    planned: { sellers: t.sellers, hotels: t.hotels, rooms: t.rooms, keys: 0 }, done: { sellers: 0, hotels: 0, rooms: 0, keys: 0, bookedNights: 0 } }, runLoadRemove);
   return { ok: true };
 });
 
